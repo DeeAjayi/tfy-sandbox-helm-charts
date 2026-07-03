@@ -1,0 +1,355 @@
+name: Helm update reusable
+
+on:
+  workflow_call:
+    inputs:
+      spec:
+        required: true
+        type: string
+      tag_map:
+        required: true
+        type: string
+      merge_pr:
+        required: false
+        type: boolean
+        default: true
+      allow_admin_merge:
+        description: Break-glass; bypass branch protection with an admin merge.
+        required: false
+        type: boolean
+        default: false
+      sync_main:
+        description: Merge main into the release branch before updating (latest line only).
+        required: false
+        type: boolean
+        default: false
+
+env:
+  RELEASE_APP_BASE_URL:       ${{ vars.RELEASE_APP_BASE_URL }}
+  RELEASE_APP_CALLBACK_TOKEN: ${{ secrets.RELEASE_APP_CALLBACK_TOKEN }}
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: helm-charts-mutation-${{ fromJSON(inputs.spec).branch }}
+      cancel-in-progress: false
+    steps:
+      - name: Checkout orchestrator (scripts + config at workflow ref)
+        uses: actions/checkout@v4
+        with:
+          path: orchestrator
+
+      - name: Notify release-app — helm running
+        run: |
+          python3 orchestrator/scripts/release/callback.py \
+            --phase helm --status running \
+            --spec '${{ inputs.spec }}'
+
+      - name: Ensure target release branch exists in helm-charts
+        env:
+          GH_TOKEN: ${{ secrets.TF_GITHUB_CI_ADMIN_TOKEN }}
+          BRANCH: ${{ fromJSON(inputs.spec).branch }}
+          # Source ref for cutting a missing CHART release branch. rc → main;
+          # hotfix on the latest line → main; hotfix on an older line → the
+          # truefoundry-<base> chart tag (the chart repo has no v<base> tags, so
+          # chart_branch_source_ref differs from the service branch_source_ref).
+          SOURCE_REF: ${{ fromJSON(inputs.spec).chart_branch_source_ref || fromJSON(inputs.spec).branch_source_ref || 'refs/heads/main' }}
+        run: |
+          if gh api "repos/${{ github.repository }}/git/ref/heads/$BRANCH" >/dev/null 2>&1; then
+            exit 0
+          fi
+          # Resolve SOURCE_REF to a commit sha. Annotated tags point at a tag
+          # object; dereference one more hop when type=tag so the new branch
+          # ref points at a commit.
+          SOURCE_PATH="${SOURCE_REF#refs/}"
+          OBJ_JSON=$(gh api "repos/${{ github.repository }}/git/ref/${SOURCE_PATH}")
+          OBJ_TYPE=$(echo "$OBJ_JSON" | jq -r '.object.type')
+          OBJ_SHA=$(echo "$OBJ_JSON" | jq -r '.object.sha')
+          if [ "$OBJ_TYPE" = "tag" ]; then
+            OBJ_SHA=$(gh api "repos/${{ github.repository }}/git/tags/$OBJ_SHA" --jq '.object.sha')
+          fi
+          echo "Creating $BRANCH from $SOURCE_REF (sha=$OBJ_SHA)"
+          gh api "repos/${{ github.repository }}/git/refs" --method POST \
+            -f "ref=refs/heads/$BRANCH" -f "sha=$OBJ_SHA"
+
+      - name: Checkout target release branch (chart files)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ fromJSON(inputs.spec).branch }}
+          fetch-depth: 0
+          token: ${{ secrets.TF_GITHUB_CI_ADMIN_TOKEN }}
+          path: chart
+
+      - name: Install python dependencies
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install ruamel.yaml pyyaml
+
+      - name: Create head branch and optionally sync main
+        id: head
+        working-directory: chart
+        env:
+          TAG: ${{ fromJSON(inputs.spec).tag }}
+          SYNC_MAIN: ${{ inputs.sync_main && fromJSON(inputs.spec).is_latest_line }}
+        run: |
+          HEAD_BRANCH="release-update-${TAG}"
+          git config user.email "ci@truefoundry.com"
+          git config user.name "truefoundry-ci"
+          git checkout -B "$HEAD_BRANCH"
+          # Merge main on a clean tree (before the values mutation). Latest line only.
+          if [ "$SYNC_MAIN" = "true" ]; then
+            git fetch origin main
+            if ! git merge --no-edit origin/main; then
+              echo "::error::Conflict merging main into $HEAD_BRANCH; resolve manually." >&2
+              exit 1
+            fi
+          fi
+          echo "head_branch=$HEAD_BRANCH" >> "$GITHUB_OUTPUT"
+
+      - name: Compute values/chart changes
+        id: update
+        run: |
+          python3 orchestrator/scripts/release/update_values.py \
+            --spec '${{ inputs.spec }}' \
+            --tag-map '${{ inputs.tag_map }}' \
+            --components-path orchestrator/config/components.yml \
+            --chart-root chart \
+            >> "$GITHUB_OUTPUT"
+
+      - name: Commit and detect changes
+        id: commit
+        working-directory: chart
+        env:
+          TAG: ${{ fromJSON(inputs.spec).tag }}
+          BASE: ${{ fromJSON(inputs.spec).branch }}
+          HEAD_BRANCH: ${{ steps.head.outputs.head_branch }}
+        run: |
+          # Stage umbrella chart changes and any standalone/nested subchart changes
+          # (e.g. charts/tfy-llm-gateway, charts/truefoundry/charts/*).
+          git add charts/
+          if ! git diff --cached --quiet; then
+            git commit -m "[release] ${TAG}"
+          fi
+          git fetch origin "$BASE"
+          # Changed if the head branch has any commit the release branch lacks
+          # (values mutation and/or a synced main merge).
+          if [ "$(git rev-list --count "origin/${BASE}..HEAD")" -gt 0 ]; then
+            git push -f origin "$HEAD_BRANCH"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "head_branch=$HEAD_BRANCH" >> "$GITHUB_OUTPUT"
+
+      - name: Open or update release PR
+        if: ${{ steps.commit.outputs.changed == 'true' }}
+        working-directory: chart
+        env:
+          GH_TOKEN: ${{ secrets.TF_GITHUB_CI_ADMIN_TOKEN }}
+          BASE_BRANCH: ${{ fromJSON(inputs.spec).branch }}
+          HEAD_BRANCH: ${{ steps.commit.outputs.head_branch }}
+          TAG: ${{ fromJSON(inputs.spec).tag }}
+          CHART_VERSION: ${{ fromJSON(inputs.spec).chart_version }}
+          TAG_MAP: ${{ inputs.tag_map }}
+        run: |
+          # Build a PR body listing the chart version and per-service image tags.
+          # For hotfixes these diverge (each service advances its own patch), so
+          # surfacing the map lets reviewers see exactly what each service ships.
+          {
+            echo "Auto-generated by release-start.yml"
+            echo
+            echo "Chart version: \`${CHART_VERSION}\`"
+            echo
+            echo "## Service image tags"
+            echo "$TAG_MAP" | jq -r 'to_entries | sort_by(.key) | .[] | "- `\(.key)`: `\(.value)`"'
+            echo
+            echo "---"
+            echo "Source: \`${GITHUB_REPOSITORY}\` workflow \`.github/workflows/release-helm-update.yml\` (called from \`release-start.yml\`)"
+            echo "Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          } > /tmp/release_pr_body.md
+          # Only an OPEN PR for this head branch can be reused; a previously
+          # merged/closed PR must not block opening a new one for new commits.
+          OPEN_COUNT=$(gh pr list --head "$HEAD_BRANCH" --base "$BASE_BRANCH" --state open --json number --jq 'length')
+          if [ "$OPEN_COUNT" -ge 1 ]; then
+            gh pr edit "$HEAD_BRANCH" --title "[release] $TAG" --body-file /tmp/release_pr_body.md
+          else
+            gh pr create --base "$BASE_BRANCH" --head "$HEAD_BRANCH" --title "[release] $TAG" --body-file /tmp/release_pr_body.md
+          fi
+
+      - name: PR opened (merge disabled)
+        if: ${{ steps.commit.outputs.changed == 'true' && !inputs.merge_pr }}
+        env:
+          GH_TOKEN: ${{ secrets.TF_GITHUB_CI_ADMIN_TOKEN }}
+        working-directory: chart
+        run: |
+          HEAD_BRANCH='${{ steps.commit.outputs.head_branch }}'
+          echo "merge_pr is disabled; leaving PR open for inspection."
+          gh pr view "$HEAD_BRANCH" --json url,title,files --jq '"PR: \(.url)\nTitle: \(.title)\nFiles: \(.files | map(.path) | join(", "))"'
+
+      - name: Enable auto-merge and wait
+        id: merge
+        if: ${{ steps.commit.outputs.changed == 'true' && inputs.merge_pr }}
+        working-directory: chart
+        env:
+          GH_TOKEN: ${{ secrets.TF_GITHUB_CI_ADMIN_TOKEN }}
+          ALLOW_ADMIN_MERGE: ${{ inputs.allow_admin_merge }}
+        run: |
+          HEAD_BRANCH='${{ steps.commit.outputs.head_branch }}'
+          # Explicit precondition: don't even attempt a merge until every
+          # check on this PR has finished and passed. --auto handles this
+          # itself, but the plain-squash fallback below is an IMMEDIATE merge
+          # attempt that GitHub only rejects if a required-status-check rule
+          # is actually scoped to this branch — not reliably true for
+          # release-v* branches — so without this a check still running (or
+          # already failed) wouldn't stop the fallback from merging anyway.
+          python3 ../orchestrator/scripts/release/wait_for_checks.py --head-branch "$HEAD_BRANCH"
+          # Prefer auto-merge so required status checks (chart-test) gate the merge.
+          # If the PR is already clean, fall back to a direct squash merge.
+          # Admin merge bypasses ALL protections (including required checks), so it is
+          # only used as an explicit break-glass via allow_admin_merge.
+          if gh pr merge "$HEAD_BRANCH" --auto --squash; then
+            :
+          elif gh pr merge "$HEAD_BRANCH" --squash; then
+            :
+          elif [ "$ALLOW_ADMIN_MERGE" = "true" ]; then
+            echo "::warning::Falling back to admin merge (bypasses branch protection)."
+            gh pr merge "$HEAD_BRANCH" --squash --admin
+          else
+            echo "::error::Could not merge $HEAD_BRANCH. A required approval/check is blocking it." >&2
+            echo "Adjust release-v* branch protection (drop required approvals / add bot to bypass) or re-run with allow_admin_merge=true." >&2
+            exit 1
+          fi
+          python3 ../orchestrator/scripts/release/wait_for_merge.py --head-branch "$HEAD_BRANCH"
+
+      - name: Set up Helm
+        if: ${{ steps.commit.outputs.changed == 'true' && inputs.merge_pr }}
+        uses: azure/setup-helm@v4.3.0
+        with:
+          version: v3.18.2
+
+      - name: Wait for independently-published subcharts in OCI
+        if: ${{ steps.commit.outputs.changed == 'true' && inputs.merge_pr }}
+        env:
+          OCI_REGISTRY: ${{ vars.TRUEFOUNDRY_ARTIFACTORY_PUBLIC_HELM_REGISTRY }}
+          REGISTRY_HOST: ${{ vars.TRUEFOUNDRY_ARTIFACTORY_REGISTRY_URL }}
+          REGISTRY_USER: ${{ secrets.TRUEFOUNDRY_ARTIFACTORY_PUBLIC_USERNAME }}
+          REGISTRY_PASS: ${{ secrets.TRUEFOUNDRY_ARTIFACTORY_PUBLIC_PASSWORD }}
+        run: |
+          # When a standalone subchart (e.g. tfy-llm-gateway) is part of the release,
+          # wait for its chart to publish to OCI (at ITS OWN tag-derived version,
+          # not the umbrella's) before the umbrella resolves it.
+          if [ -n "$REGISTRY_HOST" ] && [ -n "$REGISTRY_USER" ]; then
+            helm registry login "$REGISTRY_HOST" -u "$REGISTRY_USER" -p "$REGISTRY_PASS"
+          fi
+          python3 orchestrator/scripts/release/wait_for_chart.py \
+            --tag-map '${{ inputs.tag_map }}' \
+            --components-path orchestrator/config/components.yml \
+            --oci-registry "$OCI_REGISTRY"
+
+      # B4: forward the release branch into main via an auto-merged PR (NOT a
+      # raw push). Branch protection on main rejects direct pushes — even an FF
+      # one — so mirror the same auto-merge flow used for the release-branch
+      # update PR. Uses --squash because this repo disallows merge commits
+      # ("Merge commits are not allowed on this repository"); squash is the
+      # method that's enabled (the release-branch PR above also uses it). main's
+      # Chart.yaml is the source of truth, so collapsing into one commit is fine.
+      # Falls back to admin merge only when explicitly opted in via allow_admin_merge.
+      - name: Promote release branch into main via PR
+        if: ${{ inputs.merge_pr && fromJSON(inputs.spec).fast_forward_main == true }}
+        working-directory: chart
+        env:
+          GH_TOKEN: ${{ secrets.TF_GITHUB_CI_ADMIN_TOKEN }}
+          BASE: ${{ fromJSON(inputs.spec).branch }}
+          TAG: ${{ fromJSON(inputs.spec).tag }}
+          ALLOW_ADMIN_MERGE: ${{ inputs.allow_admin_merge }}
+        run: |
+          # Short-circuit when main is already at-or-ahead of BASE (no commits
+          # to forward — e.g. a re-run after a successful promotion).
+          git fetch origin main "$BASE"
+          AHEAD=$(git rev-list --count "origin/main..origin/${BASE}")
+          if [ "$AHEAD" = "0" ]; then
+            echo "main is already up to date with ${BASE}; nothing to promote."
+            exit 0
+          fi
+
+          # Reuse any open BASE→main PR; otherwise open a new one.
+          PROMOTE_BODY="Auto-generated by release-start.yml — forwards $BASE to main.
+
+---
+Source: \`${GITHUB_REPOSITORY}\` workflow \`.github/workflows/release-helm-update.yml\` (called from \`release-start.yml\`)
+Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          OPEN_COUNT=$(gh pr list --head "$BASE" --base main --state open --json number --jq 'length')
+          if [ "$OPEN_COUNT" -ge 1 ]; then
+            gh pr edit "$BASE" \
+              --title "[release] promote ${TAG} to main" \
+              --body "$PROMOTE_BODY"
+          else
+            gh pr create \
+              --base main \
+              --head "$BASE" \
+              --title "[release] promote ${TAG} to main" \
+              --body "$PROMOTE_BODY"
+          fi
+
+          # Same "checks must have actually passed" precondition as the
+          # release-branch merge above.
+          python3 ../orchestrator/scripts/release/wait_for_checks.py --head-branch "$BASE"
+          # Same merge ladder as the release-branch PR. --squash, because this
+          # repo does not allow merge commits (and --merge would fail even with
+          # --admin: "Merge commits are not allowed on this repository").
+          if gh pr merge "$BASE" --auto --squash; then
+            :
+          elif gh pr merge "$BASE" --squash; then
+            :
+          elif [ "$ALLOW_ADMIN_MERGE" = "true" ]; then
+            echo "::warning::Falling back to admin merge for $BASE → main (bypasses branch protection)."
+            gh pr merge "$BASE" --squash --admin
+          else
+            echo "::error::Could not merge $BASE into main. Adjust branch protection or re-run with allow_admin_merge=true." >&2
+            exit 1
+          fi
+          python3 ../orchestrator/scripts/release/wait_for_merge.py --head-branch "$BASE"
+
+      # phase=helm callback. Build the shared `data` payload once (always), then
+      # send success/failed from two if-gated steps. Status is keyed off the
+      # whole job via the success()/failure()/cancelled() status functions (only
+      # reliable in `if:`), so ANY failing step — values update, OCI wait, main
+      # promotion, setup — surfaces as failed, not just commit/merge.
+      - name: Build helm callback data
+        if: ${{ always() }}
+        env:
+          CHANGED:             ${{ steps.commit.outputs.changed }}
+          COMMIT_OUTCOME:      ${{ steps.commit.outcome }}
+          MERGE_OUTCOME:       ${{ steps.merge.outcome || 'skipped' }}
+          FAST_FORWARD_MAIN:   ${{ fromJSON(inputs.spec).fast_forward_main }}
+        run: |
+          DATA=$(python3 -c "
+          import json, os
+          print(json.dumps({
+              'changed':           os.environ.get('CHANGED') == 'true',
+              'commit_outcome':    os.environ.get('COMMIT_OUTCOME', ''),
+              'merge_outcome':     os.environ.get('MERGE_OUTCOME', ''),
+              'fast_forward_main': os.environ.get('FAST_FORWARD_MAIN', '').lower() == 'true',
+          }))
+          ")
+          echo "HELM_CALLBACK_DATA=$DATA" >> "$GITHUB_ENV"
+
+      - name: Notify release-app — helm (success)
+        if: ${{ success() }}
+        run: |
+          python3 orchestrator/scripts/release/callback.py \
+            --phase helm \
+            --status success \
+            --spec '${{ inputs.spec }}' \
+            --data "$HELM_CALLBACK_DATA"
+
+      - name: Notify release-app — helm (failed)
+        if: ${{ failure() || cancelled() }}
+        run: |
+          python3 orchestrator/scripts/release/callback.py \
+            --phase helm \
+            --status failed \
+            --spec '${{ inputs.spec }}' \
+            --data "$HELM_CALLBACK_DATA"
+

@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tfy-llm-gateway-sandbox
+data:
+  gatewayChartVersion: {{ .Values.global.gatewayChartVersion | quote }}
+  image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"

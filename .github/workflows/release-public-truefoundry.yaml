@@ -1,0 +1,262 @@
+# Copies `truefoundry` + `tfy-llm-gateway` from this repo into
+# truefoundry/infra-charts whenever a final chart release ships (triggered by
+# the bare truefoundry-X.Y.Z tag — RCs never reach this, see the tag glob
+# below). Mirrors helm-charts' own branching model instead of landing
+# directly on infra-charts main:
+#
+#   1. Ensure truefoundry-<VERSION> exists in infra-charts (cut from its
+#      main). Named after the same truefoundry-X.Y.Z string as the tag that
+#      triggered this run (and the tag infra-charts' own chart-releaser will
+#      create) — not helm-charts' own release-v<VERSION> branch name, to
+#      match the existing per-chart branch convention already used in
+#      infra-charts (e.g. truefoundry-LLMGateway-version-v*,
+#      tfy-OtelCollector-version-v*).
+#   2. Copy the charts in via a PR into THAT branch, then auto-merge.
+#   3. gh-pages publish happens off that push (infra-charts' release.yaml /
+#      artifactory-helm-release.yaml both trigger on truefoundry-* pushes).
+#   4. Only if this version is the current latest shipped line, ALSO
+#      fast-forward infra-charts main via a squash PR — same
+#      "latest-line-only" rule helm-charts applies to its own main.
+#   5. Separately, also snapshot tfy-llm-gateway (versioned independently of
+#      truefoundry) into its OWN tfy-llm-gateway-<its version> branch — pure
+#      reference so its incremental history is browsable even when its
+#      version diverges from the bundled truefoundry-<VERSION> branch above.
+#      Not part of the release/publish flow: never merges anywhere, and its
+#      name doesn't match any trigger in infra-charts' workflows.
+#
+# Nothing is ever released to gh-pages from a raw push to infra-charts main
+# for these two charts anymore — release.yaml explicitly excludes them on
+# that trigger (see infra-charts/.github/workflows/release.yaml).
+name: TrueFoundry Chart Public Release
+
+on:
+  push:
+    tags:
+      - "truefoundry-[0-9]+.[0-9]+.[0-9]+"
+
+env:
+  # Override via repo variable INFRA_CHARTS_REPO for sandbox/fork testing.
+  INFRA_REPO: ${{ vars.INFRA_CHARTS_REPO || 'truefoundry/infra-charts' }}
+
+jobs:
+  release_truefoundry:
+    name: Release Truefoundry
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Extract version from tag
+        id: extract_version
+        run: |
+          TAG_NAME=${GITHUB_REF#refs/tags/}
+          VERSION=$(echo "$TAG_NAME" | sed 's/truefoundry-//')
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "INFRA_BRANCH=truefoundry-${VERSION}" >> "$GITHUB_ENV"
+
+      - name: Update chart version
+        run: |
+          CHART_FILE="./charts/truefoundry/Chart.yaml"
+          yq e ".version = env(VERSION)" -i "$CHART_FILE"
+        env:
+          VERSION: ${{ env.VERSION }}
+
+      # This tag's own commit is the source of truth for "is this the
+      # current latest line" — compare it against every other final
+      # truefoundry-X.Y.Z tag rather than trusting main (main may lag or,
+      # per this same change, never be touched at all for an older line).
+      - name: Determine whether this is the latest shipped line
+        id: latest_line
+        run: |
+          LATEST=$(git tag -l 'truefoundry-*' \
+            | grep -E '^truefoundry-[0-9]+\.[0-9]+\.[0-9]+$' \
+            | sed 's/truefoundry-//' \
+            | sort -V | tail -1)
+          if [ "$VERSION" = "$LATEST" ]; then
+            echo "is_latest_line=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_latest_line=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "Latest shipped truefoundry tag: ${LATEST:-<none>}; this release: $VERSION"
+
+      - name: Ensure infra-charts release branch exists
+        env:
+          GH_TOKEN: ${{ secrets.TF_GITHUB_CI_ADMIN_TOKEN }}
+        run: |
+          if gh api "repos/${INFRA_REPO}/git/ref/heads/${INFRA_BRANCH}" >/dev/null 2>&1; then
+            echo "${INFRA_BRANCH} already exists in ${INFRA_REPO}"
+            exit 0
+          fi
+          MAIN_SHA=$(gh api "repos/${INFRA_REPO}/git/ref/heads/main" --jq .object.sha)
+          gh api "repos/${INFRA_REPO}/git/refs" --method POST \
+            -f "ref=refs/heads/${INFRA_BRANCH}" -f "sha=${MAIN_SHA}"
+          echo "Created ${INFRA_BRANCH} in ${INFRA_REPO} from main"
+
+      - name: Install python dependencies
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install pyyaml
+
+      - name: Checkout charts
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.INFRA_CHARTS_REPO || 'truefoundry/infra-charts' }}
+          ref: ${{ env.INFRA_BRANCH }}
+          token: ${{ secrets.TF_GITHUB_CI_ADMIN_TOKEN }}
+          path: tmp_ahc
+
+      - name: Copy charts
+        run: |
+          rm -r ./tmp_ahc/charts/truefoundry
+          rm -r ./tmp_ahc/charts/tfy-llm-gateway
+          cp -r ./charts/truefoundry ./tmp_ahc/charts/
+          cp -r ./charts/tfy-llm-gateway ./tmp_ahc/charts/
+
+      - name: Update Helm dependencies for Truefoundry chart
+        run: |
+          helm dependency update ./tmp_ahc/charts/truefoundry
+          rm -rf ./tmp_ahc/charts/truefoundry/charts/*.tgz
+          helm dependency update ./tmp_ahc/charts/tfy-llm-gateway
+          rm -rf ./tmp_ahc/charts/tfy-llm-gateway/charts/*.tgz
+
+      - name: Create Pull Request into the release branch
+        id: create_pr
+        uses: peter-evans/create-pull-request@v5
+        with:
+          commit-message: "[CI] Publish Truefoundry chart version ${{ env.VERSION }}"
+          branch: truefoundry-version-${{ env.VERSION }}
+          base: ${{ env.INFRA_BRANCH }}
+          path: tmp_ahc
+          title: "[CI] Publish truefoundry to version ${{ env.VERSION }}"
+          body: |
+            Copies `truefoundry` and `tfy-llm-gateway` at version `${{ env.VERSION }}` from `truefoundry/helm-charts` into `charts/`, on the release branch — gh-pages publish happens off this branch, not off main.
+
+            ---
+            Source: `truefoundry/helm-charts` workflow `.github/workflows/release-public-truefoundry.yaml`
+            Triggered by tag: `${{ github.ref_name }}`
+            Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          token: ${{ secrets.TF_GITHUB_CI_ADMIN_TOKEN }}
+
+      - name: Merge into the release branch
+        if: ${{ steps.create_pr.outputs.pull-request-operation == 'created' || steps.create_pr.outputs.pull-request-operation == 'updated' }}
+        env:
+          GH_TOKEN: ${{ secrets.TF_GITHUB_CI_ADMIN_TOKEN }}
+          HEAD_BRANCH: truefoundry-version-${{ env.VERSION }}
+        run: |
+          # Explicit precondition: the plain-squash fallback below is an
+          # IMMEDIATE merge attempt that infra-charts only rejects if a
+          # required-status-check rule is actually scoped to this branch —
+          # not reliably true here — so without this, a check still running
+          # (or already failed) wouldn't stop the fallback from merging anyway.
+          python3 scripts/release/wait_for_checks.py --repo "$INFRA_REPO" --head-branch "$HEAD_BRANCH"
+          if gh pr merge "$HEAD_BRANCH" --repo "$INFRA_REPO" --auto --squash; then
+            :
+          elif gh pr merge "$HEAD_BRANCH" --repo "$INFRA_REPO" --squash; then
+            :
+          else
+            echo "::warning::Falling back to admin merge for $HEAD_BRANCH (bypasses branch protection)."
+            gh pr merge "$HEAD_BRANCH" --repo "$INFRA_REPO" --squash --admin
+          fi
+          python3 scripts/release/wait_for_merge.py --repo "$INFRA_REPO" --head-branch "$HEAD_BRANCH"
+
+      # Only the current latest line ever advances infra-charts main — same
+      # rule helm-charts applies to its OWN main. An older-line hotfix final
+      # still published above (branch + gh-pages), it just never reaches main.
+      - name: Promote release branch into infra-charts main
+        if: ${{ steps.latest_line.outputs.is_latest_line == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.TF_GITHUB_CI_ADMIN_TOKEN }}
+        run: |
+          gh api "repos/${INFRA_REPO}/git/ref/heads/main" --jq .object.sha > /tmp/main_sha
+          gh api "repos/${INFRA_REPO}/git/ref/heads/${INFRA_BRANCH}" --jq .object.sha > /tmp/branch_sha
+          if [ "$(cat /tmp/main_sha)" = "$(cat /tmp/branch_sha)" ]; then
+            echo "main is already up to date with ${INFRA_BRANCH}; nothing to promote."
+            exit 0
+          fi
+
+          {
+            echo "Auto-generated by release-public-truefoundry.yaml — forwards ${INFRA_BRANCH} to main."
+            echo
+            echo "---"
+            echo "Source: \`${GITHUB_REPOSITORY}\` workflow \`.github/workflows/release-public-truefoundry.yaml\`"
+            echo "Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          } > /tmp/promote_body.md
+
+          OPEN_COUNT=$(gh pr list --repo "$INFRA_REPO" --head "$INFRA_BRANCH" --base main --state open --json number --jq 'length')
+          if [ "$OPEN_COUNT" -ge 1 ]; then
+            gh pr edit "$INFRA_BRANCH" --repo "$INFRA_REPO" \
+              --title "[release] promote ${VERSION} to main" --body-file /tmp/promote_body.md
+          else
+            gh pr create --repo "$INFRA_REPO" --base main --head "$INFRA_BRANCH" \
+              --title "[release] promote ${VERSION} to main" --body-file /tmp/promote_body.md
+          fi
+
+          python3 scripts/release/wait_for_checks.py --repo "$INFRA_REPO" --head-branch "$INFRA_BRANCH"
+          if gh pr merge "$INFRA_BRANCH" --repo "$INFRA_REPO" --auto --squash; then
+            :
+          elif gh pr merge "$INFRA_BRANCH" --repo "$INFRA_REPO" --squash; then
+            :
+          else
+            echo "::warning::Falling back to admin merge for ${INFRA_BRANCH} -> main (bypasses branch protection)."
+            gh pr merge "$INFRA_BRANCH" --repo "$INFRA_REPO" --squash --admin
+          fi
+          python3 scripts/release/wait_for_merge.py --repo "$INFRA_REPO" --head-branch "$INFRA_BRANCH"
+
+      # Reference-only: tfy-llm-gateway is versioned independently of
+      # truefoundry (see update_values.py), so the bundled truefoundry-<VERSION>
+      # branch above doesn't reflect the gateway's OWN version when the two
+      # lines diverge. This gives it a branch named after its own version
+      # purely so its incremental history is browsable on its own — it is
+      # NOT part of the release/publish flow: it never merges into main,
+      # and its name (tfy-llm-gateway-*) doesn't match any trigger in
+      # infra-charts' release.yaml / artifactory-helm-release.yaml, so it
+      # can't accidentally cause a duplicate publish.
+      - name: Determine tfy-llm-gateway's own version
+        id: gateway_version
+        run: |
+          GATEWAY_VERSION=$(yq e '.version' ./charts/tfy-llm-gateway/Chart.yaml)
+          echo "GATEWAY_VERSION=$GATEWAY_VERSION" >> "$GITHUB_ENV"
+          echo "GATEWAY_BRANCH=tfy-llm-gateway-${GATEWAY_VERSION}" >> "$GITHUB_ENV"
+
+      - name: Ensure tfy-llm-gateway reference branch exists
+        id: ensure_gateway_branch
+        env:
+          GH_TOKEN: ${{ secrets.TF_GITHUB_CI_ADMIN_TOKEN }}
+        run: |
+          if gh api "repos/${INFRA_REPO}/git/ref/heads/${GATEWAY_BRANCH}" >/dev/null 2>&1; then
+            echo "${GATEWAY_BRANCH} already exists in ${INFRA_REPO}; nothing to snapshot (same version already recorded)."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            MAIN_SHA=$(gh api "repos/${INFRA_REPO}/git/ref/heads/main" --jq .object.sha)
+            gh api "repos/${INFRA_REPO}/git/refs" --method POST \
+              -f "ref=refs/heads/${GATEWAY_BRANCH}" -f "sha=${MAIN_SHA}"
+            echo "Created ${GATEWAY_BRANCH} in ${INFRA_REPO} from main"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout tfy-llm-gateway reference branch
+        if: ${{ steps.ensure_gateway_branch.outputs.skip == 'false' }}
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.INFRA_CHARTS_REPO || 'truefoundry/infra-charts' }}
+          ref: ${{ env.GATEWAY_BRANCH }}
+          token: ${{ secrets.TF_GITHUB_CI_ADMIN_TOKEN }}
+          path: tmp_gateway_ref
+
+      - name: Snapshot tfy-llm-gateway into its reference branch
+        if: ${{ steps.ensure_gateway_branch.outputs.skip == 'false' }}
+        working-directory: tmp_gateway_ref
+        run: |
+          rm -rf charts/tfy-llm-gateway
+          cp -r ../charts/tfy-llm-gateway charts/
+          git config user.name "truefoundry-ci"
+          git config user.email "ci@truefoundry.com"
+          git add charts/tfy-llm-gateway
+          if git diff --cached --quiet; then
+            echo "No changes to charts/tfy-llm-gateway on a freshly-cut branch; nothing to commit."
+          else
+            git commit -m "[CI] tfy-llm-gateway ${GATEWAY_VERSION} (reference snapshot, not released from this branch)"
+            git push origin "HEAD:refs/heads/${GATEWAY_BRANCH}"
+          fi

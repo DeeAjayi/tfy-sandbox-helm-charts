@@ -1,0 +1,6 @@
+apiVersion: v2
+name: tfy-llm-gateway
+version: 0.1.0
+description: "Sandbox stand-in for the tfy-llm-gateway chart"
+maintainers:
+  - name: sandbox

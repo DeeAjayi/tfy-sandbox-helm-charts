@@ -1,0 +1,51 @@
+# Version bumps for truefoundry / tfy-llm-gateway must land through the
+# release-vX.Y.Z pipeline (release-start.yml), never directly on main — a
+# version bumped on main would never get built, tagged, published, or
+# deployed (oci-release.yml only triggers on push to release-v* branches),
+# so a stray main-side bump just silently drifts out of sync with what's
+# actually shipped. This blocks that specific mistake at PR time.
+#
+# NOTE: for this to actually BLOCK a merge (not just show as a failing,
+# ignorable check), the "block-version-bump" job must be added as a required
+# status check on main — see the repo's branch ruleset settings. The
+# workflow alone only reports failure; GitHub only prevents merging when a
+# failing check is marked required.
+name: Block version bump on main
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'charts/truefoundry/Chart.yaml'
+      - 'charts/tfy-llm-gateway/Chart.yaml'
+
+jobs:
+  block-version-bump:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch PR base commit
+        run: git fetch --depth=1 origin "${{ github.event.pull_request.base.sha }}"
+
+      - name: Fail if Chart.yaml version changed
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          FAILED=0
+          for CHART in charts/truefoundry/Chart.yaml charts/tfy-llm-gateway/Chart.yaml; do
+            if ! git cat-file -e "${BASE_SHA}:${CHART}" 2>/dev/null; then
+              continue
+            fi
+            BASE_VERSION=$(git show "${BASE_SHA}:${CHART}" | yq e '.version' -)
+            HEAD_VERSION=$(yq e '.version' "$CHART")
+            if [ "$BASE_VERSION" != "$HEAD_VERSION" ]; then
+              echo "::error file=${CHART}::${CHART} version changed from ${BASE_VERSION} to ${HEAD_VERSION} in a PR targeting main. Version bumps must go through release-start.yml on a release-vX.Y.Z branch — a version bumped directly on main is never built, tagged, published, or deployed."
+              FAILED=1
+            fi
+          done
+          exit $FAILED

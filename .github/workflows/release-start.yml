@@ -1,0 +1,485 @@
+name: Release start
+
+on:
+  workflow_dispatch:
+    inputs:
+      kind:
+        description: Release kind
+        type: choice
+        options:
+          - rc
+          - prod
+          - hotfix
+        required: true
+      repositories:
+        description: JSON array of repositories
+        type: string
+        required: false
+        default: "[]"
+      base_version:
+        description: Optional base version for prod/hotfix targeting
+        type: string
+        required: false
+        default: ""
+      skip_rc:
+        description: "Hotfix only: build the final patch directly without an RC stage."
+        type: boolean
+        required: false
+        default: false
+      chart_only:
+        description: "Hotfix only: bump ONLY the umbrella chart (templates/version) — no service is built or retagged. repositories must be empty. For template-only fixes to charts/truefoundry or charts/tfy-llm-gateway."
+        type: boolean
+        required: false
+        default: false
+      merge_pr:
+        description: Merge the chart PR and continue to publish. Disable to stop after opening the PR.
+        type: boolean
+        required: false
+        default: true
+      allow_admin_merge:
+        description: Break-glass; bypass branch protection with an admin merge if normal merge is blocked.
+        type: boolean
+        required: false
+        default: false
+      sync_main:
+        description: Merge main into the release branch before updating (latest line only).
+        type: boolean
+        required: false
+        default: false
+      deploy_only:
+        description: "Skip build/helm/publish and ONLY deploy (when those steps were already run). RC → develop; prod → develop + prod; hotfix → develop (+ prod for a final patch)."
+        type: boolean
+        required: false
+        default: false
+      deploy_version:
+        description: "deploy_only: the EXACT chart version to deploy, e.g. v0.149.0 (prod) or 0.149.0-rc.4 (RC). Required when deploy_only=true."
+        type: string
+        required: false
+        default: ""
+
+run-name: "release-${{ inputs.kind }}-${{ github.run_number }}"
+
+# Phase-level callbacks POST to <RELEASE_APP_BASE_URL>/api/v1/releases/<GITHUB_RUN_ID>/callback
+# with Bearer auth. callback.py is fire-and-forget: any missing env (fork PR,
+# unwired dev runs) makes it log and exit 0. The run row in release-app is
+# keyed by GITHUB_RUN_ID (= gha_workflow_run_id column); no separate input is
+# threaded through — release-app handles "orphan callbacks" (manual dispatches
+# with no pre-existing row) by creating one on the first event.
+env:
+  RELEASE_APP_BASE_URL:       ${{ vars.RELEASE_APP_BASE_URL }}
+  RELEASE_APP_CALLBACK_TOKEN: ${{ secrets.RELEASE_APP_CALLBACK_TOKEN }}
+
+jobs:
+  compute_release:
+    # In deploy-only mode the version is supplied directly via deploy_version,
+    # so we skip computing a (next) version entirely.
+    if: ${{ inputs.deploy_only != true }}
+    runs-on: ubuntu-latest
+    outputs:
+      spec: ${{ steps.compute.outputs.spec }}
+      target_version: ${{ steps.compute.outputs.target_version }}
+      branch: ${{ steps.compute.outputs.branch }}
+      mode: ${{ steps.compute.outputs.mode }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      # Mark the phase running at job start so release-app records a real start
+      # time from the callback (no spec yet — it's computed below).
+      - name: Notify release-app — compute running
+        run: |
+          python3 scripts/release/callback.py --phase compute --status running
+      - name: Install python dependencies
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install pyyaml
+      - id: compute
+        # GH token: hotfix version math consults each service repo's own latest
+        # v<major>.<minor>.* tag (compute_release.latest_service_line_tag) so the
+        # chart's possibly-stale pinned tag can't recompute an already-shipped
+        # patch and skip the build. Same admin token used by the other jobs.
+        env:
+          GH_TOKEN: ${{ secrets.TF_GITHUB_CI_ADMIN_TOKEN }}
+        run: |
+          python3 scripts/release/compute_release.py \
+            --kind '${{ inputs.kind }}' \
+            --repositories '${{ inputs.repositories }}' \
+            --base-version '${{ inputs.base_version }}' \
+            ${{ inputs.skip_rc && '--skip-rc' || '' }} \
+            ${{ inputs.chart_only && '--chart-only' || '' }} \
+            >> "$GITHUB_OUTPUT"
+
+      # phase=compute callback. Runs on success AND failure (if: always())
+      # so the release-app can mark the run as failed-at-compute when the
+      # spec couldn't be produced. Status is derived from steps.compute.outcome.
+      - name: Notify release-app — compute
+        if: ${{ always() }}
+        run: |
+          python3 scripts/release/callback.py \
+            --phase compute \
+            --status "${{ steps.compute.outcome == 'success' && 'success' || 'failed' }}" \
+            --spec '${{ steps.compute.outputs.spec || '{}' }}'
+
+  ensure_service_branches:
+    needs: compute_release
+    if: ${{ inputs.deploy_only != true && fromJSON(needs.compute_release.outputs.spec).mode == 'build' }}
+    runs-on: ubuntu-latest
+    concurrency:
+      group: ensure-branches-${{ needs.compute_release.outputs.branch }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - name: Notify release-app — branches running
+        run: |
+          python3 scripts/release/callback.py \
+            --phase branches --status running \
+            --spec '${{ needs.compute_release.outputs.spec }}'
+      - name: Install python dependencies
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install pyyaml
+      - id: ensure
+        name: Ensure release branch exists in all service repos
+        env:
+          GH_TOKEN: ${{ secrets.TF_GITHUB_CI_ADMIN_TOKEN }}
+        run: |
+          python3 scripts/release/ensure_service_branches.py \
+            --spec '${{ needs.compute_release.outputs.spec }}'
+
+      - name: Notify release-app — branches
+        if: ${{ always() }}
+        run: |
+          python3 scripts/release/callback.py \
+            --phase branches \
+            --status "${{ steps.ensure.outcome == 'success' && 'success' || 'failed' }}" \
+            --spec '${{ needs.compute_release.outputs.spec }}'
+
+  build:
+    needs:
+      - compute_release
+      - ensure_service_branches
+    if: ${{ inputs.deploy_only != true && fromJSON(needs.compute_release.outputs.spec).mode == 'build' }}
+    uses: ./.github/workflows/release-build-services.yml
+    with:
+      spec: ${{ needs.compute_release.outputs.spec }}
+    secrets: inherit
+
+  retag:
+    needs: compute_release
+    if: ${{ inputs.deploy_only != true && fromJSON(needs.compute_release.outputs.spec).mode == 'retag' }}
+    runs-on: ubuntu-latest
+    outputs:
+      tag_map: ${{ steps.retag.outputs.tag_map }}
+      commit_map: ${{ steps.retag.outputs.commit_map }}
+    concurrency:
+      group: retag-${{ needs.compute_release.outputs.target_version }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Notify release-app — retag running
+        run: |
+          python3 scripts/release/callback.py \
+            --phase retag --status running \
+            --spec '${{ needs.compute_release.outputs.spec }}'
+      - name: Install python dependencies
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install pyyaml
+      - id: retag
+        # retag.py logs in to each registry with its own deploy-capable
+        # credentials before pushing. Public and private images share the
+        # tfy.jfrog.io host, so a single docker login cannot cover both — the
+        # script authenticates per registry (private images with private creds,
+        # the public tfy-workflow-agent image with public creds), which avoids
+        # the 403 "No permission to write manifest" on public-image retags.
+        env:
+          GH_TOKEN: ${{ secrets.TF_GITHUB_CI_ADMIN_TOKEN }}
+          ARTIFACTORY_PRIVATE_REGISTRY: ${{ vars.TRUEFOUNDRY_ARTIFACTORY_PRIVATE_REPOSITORY }}
+          ARTIFACTORY_PUBLIC_REGISTRY: ${{ vars.TRUEFOUNDRY_ARTIFACTORY_PUBLIC_REPOSITORY }}
+          ARTIFACTORY_PRIVATE_USERNAME: ${{ secrets.TRUEFOUNDRY_ARTIFACTORY_PRIVATE_USERNAME }}
+          ARTIFACTORY_PRIVATE_PASSWORD: ${{ secrets.TRUEFOUNDRY_ARTIFACTORY_PRIVATE_PASSWORD }}
+          ARTIFACTORY_PUBLIC_USERNAME: ${{ secrets.TRUEFOUNDRY_ARTIFACTORY_PUBLIC_USERNAME }}
+          ARTIFACTORY_PUBLIC_PASSWORD: ${{ secrets.TRUEFOUNDRY_ARTIFACTORY_PUBLIC_PASSWORD }}
+        run: |
+          python3 scripts/release/retag.py \
+            --spec '${{ needs.compute_release.outputs.spec }}' \
+            >> "$GITHUB_OUTPUT"
+
+      # phase=retag callback. Forwards tag_map + commit_map so the release-app
+      # can render per-component results before helm/publish run.
+      - name: Notify release-app — retag
+        if: ${{ always() }}
+        env:
+          TAG_MAP:    ${{ steps.retag.outputs.tag_map }}
+          COMMIT_MAP: ${{ steps.retag.outputs.commit_map }}
+        run: |
+          DATA=$(python3 -c "
+          import json, os
+          print(json.dumps({
+              'tag_map':    json.loads(os.environ.get('TAG_MAP')    or '{}'),
+              'commit_map': json.loads(os.environ.get('COMMIT_MAP') or '{}'),
+          }))
+          ")
+          python3 scripts/release/callback.py \
+            --phase retag \
+            --status "${{ steps.retag.outcome == 'success' && 'success' || 'failed' }}" \
+            --spec '${{ needs.compute_release.outputs.spec }}' \
+            --data "$DATA"
+
+  resolve_outputs:
+    needs:
+      - compute_release
+      - build
+      - retag
+    if: >-
+      ${{ always() && needs.compute_release.result == 'success' && (
+        (needs.compute_release.outputs.mode == 'build' && needs.build.result == 'success' && needs.retag.result == 'skipped') ||
+        (needs.compute_release.outputs.mode == 'retag' && needs.retag.result == 'success' && needs.build.result == 'skipped')
+      ) }}
+    runs-on: ubuntu-latest
+    outputs:
+      tag_map: ${{ steps.resolve.outputs.tag_map }}
+      commit_map: ${{ steps.resolve.outputs.commit_map }}
+    steps:
+      - id: resolve
+        env:
+          MODE: ${{ needs.compute_release.outputs.mode }}
+          BUILD_TAG_MAP: ${{ needs.build.outputs.tag_map }}
+          BUILD_COMMIT_MAP: ${{ needs.build.outputs.commit_map }}
+          RETAG_TAG_MAP: ${{ needs.retag.outputs.tag_map }}
+          RETAG_COMMIT_MAP: ${{ needs.retag.outputs.commit_map }}
+        run: |
+          if [ -z "$MODE" ]; then
+            echo "MODE output from compute_release is empty" >&2
+            exit 1
+          fi
+          if [ "$MODE" = "build" ]; then
+            echo "tag_map=${BUILD_TAG_MAP}" >> "$GITHUB_OUTPUT"
+            echo "commit_map=${BUILD_COMMIT_MAP}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag_map=${RETAG_TAG_MAP}" >> "$GITHUB_OUTPUT"
+            echo "commit_map=${RETAG_COMMIT_MAP}" >> "$GITHUB_OUTPUT"
+          fi
+
+  helm:
+    needs:
+      - compute_release
+      - resolve_outputs
+    if: ${{ !cancelled() && needs.resolve_outputs.result == 'success' }}
+    uses: ./.github/workflows/release-helm-update.yml
+    with:
+      spec: ${{ needs.compute_release.outputs.spec }}
+      tag_map: ${{ needs.resolve_outputs.outputs.tag_map }}
+      merge_pr: ${{ inputs.merge_pr }}
+      allow_admin_merge: ${{ inputs.allow_admin_merge }}
+      sync_main: ${{ inputs.sync_main }}
+    secrets: inherit
+
+  publish_releases:
+    needs:
+      - compute_release
+      - resolve_outputs
+      - helm
+    # Per-service git tags + GitHub releases come from the already-built/retagged
+    # service artifacts, so they publish as soon as the build/retag is done
+    # (resolve_outputs succeeded) — INDEPENDENT of the chart PR merge. Previously
+    # this was gated on helm success, so a failed chart merge also blocked the
+    # service releases; now they ship regardless.
+    #
+    # The chart's OWN tag/release still only publishes when helm actually merged:
+    # merge_pr is ANDed with helm success below, so a failed/deferred merge skips
+    # just the chart release inside the reusable workflow, not the service ones.
+    if: ${{ !cancelled() && needs.resolve_outputs.result == 'success' }}
+    uses: ./.github/workflows/release-publish-releases.yml
+    with:
+      spec: ${{ needs.compute_release.outputs.spec }}
+      tag_map: ${{ needs.resolve_outputs.outputs.tag_map }}
+      commit_map: ${{ needs.resolve_outputs.outputs.commit_map }}
+      merge_pr: ${{ inputs.merge_pr && needs.helm.result == 'success' }}
+    secrets: inherit
+
+  # Deploy to the DEVELOP cluster: bump truefoundry's targetRevision in
+  # ubermold-base (develop branch); pushing to develop triggers
+  # publish-ubermold-develop.yaml → PR into ubermold-develop → ArgoCD sync.
+  # Runs for RC (QA on develop), prod (a prod release lands on both clusters),
+  # AND latest-line hotfix (both its RC and its final). Older-line hotfixes are
+  # skipped here: develop tracks the latest line, so deploying an older patch
+  # would downgrade it (spec.on_latest_line guards this). deploy-only trusts the
+  # operator-supplied deploy_version, so it runs without the spec guard.
+  deploy_develop:
+    needs:
+      - compute_release
+      - publish_releases
+    if: >-
+      ${{ !cancelled()
+          && (
+            (inputs.deploy_only
+              && (inputs.kind == 'rc' || inputs.kind == 'prod' || inputs.kind == 'hotfix'))
+            || (needs.publish_releases.result == 'success'
+              && (inputs.kind == 'rc'
+                || inputs.kind == 'prod'
+                || (inputs.kind == 'hotfix'
+                  && fromJSON(needs.compute_release.outputs.spec || '{}').on_latest_line == true)))
+          ) }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Notify release-app — deploy_develop running
+        if: ${{ inputs.deploy_only != true }}
+        run: |
+          python3 scripts/release/callback.py \
+            --phase deploy_develop --status running \
+            --spec '${{ needs.compute_release.outputs.spec }}'
+      - name: Deploy to develop (bump ubermold-base)
+        id: deploy
+        env:
+          GH_TOKEN: ${{ secrets.TF_GITHUB_CI_ADMIN_TOKEN }}
+          # Sandbox/fork overrides; empty in prod so deploy.py uses its defaults.
+          UBERMOLD_ORG: ${{ vars.UBERMOLD_ORG }}
+          UBERMOLD_BASE_REPO: ${{ vars.UBERMOLD_BASE_REPO }}
+          UBERMOLD_PROD_REPO: ${{ vars.UBERMOLD_PROD_REPO }}
+        run: |
+          python3 scripts/release/deploy.py \
+            --target develop \
+            --version '${{ inputs.deploy_only && inputs.deploy_version || fromJSON(needs.compute_release.outputs.spec).tag }}'
+      - name: Notify release-app — deploy_develop
+        if: ${{ always() && inputs.deploy_only != true }}
+        run: |
+          python3 scripts/release/callback.py \
+            --phase deploy_develop \
+            --status "${{ steps.deploy.outcome == 'success' && 'success' || 'failed' }}" \
+            --spec '${{ needs.compute_release.outputs.spec }}'
+
+  # Deploy to PROD: bump truefoundry's targetRevision in ubermold-truefoundry via
+  # a PR that is auto-merged (no manual approval — the prod release + helm steps
+  # already succeeded). The merge triggers apply-tfy-prod.yaml against the prod
+  # cluster. Runs for prod promotions AND for a latest-line hotfix FINAL (a
+  # skip_rc hotfix that ships a real vX.Y.Z tag): spec.fast_forward_main is true
+  # only for such a final on the latest line, so hotfix RCs (RC tags) and
+  # older-line hotfixes never reach prod here. deploy-only trusts the operator-
+  # supplied deploy_version, so it runs without the spec guard.
+  #
+  # `prod` ALSO requires fast_forward_main==true here (not just `inputs.kind ==
+  # 'prod'`): a `prod` promotion normally targets the latest line, where
+  # fast_forward_main is true by construction — but an operator CAN promote an
+  # OLDER line to prod via `base_version` (see compute_release.py's `prod`
+  # branch), which computes fast_forward_main=false. Without this guard, that
+  # would still open a PR bumping ubermold-truefoundry's live prod
+  # targetRevision to the older version — a downgrade from whatever's
+  # currently deployed.
+  deploy_prod:
+    needs:
+      - compute_release
+      - publish_releases
+    if: >-
+      ${{ !cancelled()
+          && (
+            (inputs.deploy_only
+              && (inputs.kind == 'prod' || inputs.kind == 'hotfix'))
+            || (needs.publish_releases.result == 'success'
+              && (inputs.kind == 'prod' || inputs.kind == 'hotfix')
+              && fromJSON(needs.compute_release.outputs.spec || '{}').fast_forward_main == true)
+          ) }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Notify release-app — deploy_prod running
+        if: ${{ inputs.deploy_only != true }}
+        run: |
+          python3 scripts/release/callback.py \
+            --phase deploy_prod --status running \
+            --spec '${{ needs.compute_release.outputs.spec }}'
+      - name: Open prod deploy PR (bump ubermold-truefoundry)
+        id: deploy
+        env:
+          GH_TOKEN: ${{ secrets.TF_GITHUB_CI_ADMIN_TOKEN }}
+          # Sandbox/fork overrides; empty in prod so deploy.py uses its defaults.
+          UBERMOLD_ORG: ${{ vars.UBERMOLD_ORG }}
+          UBERMOLD_BASE_REPO: ${{ vars.UBERMOLD_BASE_REPO }}
+          UBERMOLD_PROD_REPO: ${{ vars.UBERMOLD_PROD_REPO }}
+        run: |
+          python3 scripts/release/deploy.py \
+            --target prod \
+            --version '${{ inputs.deploy_only && inputs.deploy_version || fromJSON(needs.compute_release.outputs.spec).tag }}'
+      - name: Notify release-app — deploy_prod
+        if: ${{ always() && inputs.deploy_only != true }}
+        run: |
+          python3 scripts/release/callback.py \
+            --phase deploy_prod \
+            --status "${{ steps.deploy.outcome == 'success' && 'success' || 'failed' }}" \
+            --spec '${{ needs.compute_release.outputs.spec }}'
+
+  summarize:
+    needs:
+      - compute_release
+      - resolve_outputs
+      - helm
+      - publish_releases
+    # Skipped in deploy-only mode: build/helm/publish never ran, so the finalize
+    # rollup would otherwise report a false failure.
+    if: ${{ always() && inputs.deploy_only != true }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Notify release-app — finalize running
+        if: ${{ always() }}
+        run: |
+          python3 scripts/release/callback.py \
+            --phase finalize --status running \
+            --spec '${{ needs.compute_release.outputs.spec }}'
+      - name: Write release summary + notify
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          python3 scripts/release/summarize_release.py \
+            --spec '${{ needs.compute_release.outputs.spec }}' \
+            --tag-map '${{ needs.resolve_outputs.outputs.tag_map }}' \
+            --commit-map '${{ needs.resolve_outputs.outputs.commit_map }}' \
+            --helm-result '${{ needs.helm.result }}' \
+            --publish-result '${{ needs.publish_releases.result }}' \
+            --run-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+      - name: Upload release record
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-record
+          path: release-record.json
+
+      # phase=finalize callback. Always runs; status reflects the union of helm
+      # + publish job outcomes (matches the Slack rollup in summarize_release.py).
+      # `data` carries the final tag_map/commit_map + per-phase job outcomes so
+      # the release-app row can show a complete picture without polling GitHub.
+      - name: Notify release-app — finalize
+        if: ${{ always() }}
+        env:
+          TAG_MAP:        ${{ needs.resolve_outputs.outputs.tag_map }}
+          COMMIT_MAP:     ${{ needs.resolve_outputs.outputs.commit_map }}
+          HELM_RESULT:    ${{ needs.helm.result }}
+          PUBLISH_RESULT: ${{ needs.publish_releases.result }}
+        run: |
+          DATA=$(python3 -c "
+          import json, os
+          helm    = os.environ.get('HELM_RESULT', '')
+          publish = os.environ.get('PUBLISH_RESULT', '')
+          print(json.dumps({
+              'tag_map':        json.loads(os.environ.get('TAG_MAP')    or '{}'),
+              'commit_map':     json.loads(os.environ.get('COMMIT_MAP') or '{}'),
+              'helm_result':    helm,
+              'publish_result': publish,
+          }))
+          ")
+          # Overall is success only when helm succeeded AND publish succeeded
+          # or was legitimately skipped (merge_pr=false). Mirrors summarize_release.py.
+          HELM='${{ needs.helm.result }}'
+          PUBLISH='${{ needs.publish_releases.result }}'
+          if [ "$HELM" = "success" ] && { [ "$PUBLISH" = "success" ] || [ "$PUBLISH" = "skipped" ]; }; then
+            STATUS=success
+          else
+            STATUS=failed
+          fi
+          python3 scripts/release/callback.py \
+            --phase finalize \
+            --status "$STATUS" \
+            --spec '${{ needs.compute_release.outputs.spec }}' \
+            --data "$DATA"

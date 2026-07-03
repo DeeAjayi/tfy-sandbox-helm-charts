@@ -1,0 +1,156 @@
+# Copies the listed chart(s) out of this repo into truefoundry/infra-charts
+# (ensures a per-chart-version branch there, replaces the chart directory,
+# runs `helm dependency update`, then opens a PR into THAT branch via
+# peter-evans/create-pull-request).
+#
+# Manual-only: the automatic "push to main" trigger was removed because it
+# duplicated release-public-truefoundry.yaml, which already copies both
+# truefoundry AND tfy-llm-gateway into infra-charts whenever a
+# truefoundry-X.Y.Z tag is published by the release-start.yml pipeline — the
+# two were opening competing infra-charts PRs for the same tfy-llm-gateway
+# bump on every latest-line promotion. Dispatch this manually only for an
+# out-of-band re-publish (e.g. the infra-charts PR from that flow was closed
+# or lost).
+#
+# Targets a branch (named after the chart(s)+version, e.g.
+# tfy-llm-gateway-0.148.4 — the SAME branch release-public-truefoundry.yaml
+# creates as tfy-llm-gateway's reference snapshot), NOT infra-charts main:
+# infra-charts' block-version-bump-on-main.yaml rejects any PR into main that
+# changes one of these charts' Chart.yaml version, since that's supposed to
+# only ever happen through this repo's own release pipeline. Targeting the
+# per-version branch instead sidesteps that check entirely (it only applies
+# to PRs into main) while still landing the content somewhere reviewable.
+#
+# NOTE: merging the resulting PR alone does NOT publish anything — that
+# branch name doesn't match infra-charts' publish triggers (main,
+# truefoundry-[0-9]*). If you actually need this re-published (not just
+# landed in git for reference), manually dispatch infra-charts'
+# release.yaml and/or artifactory-helm-release.yaml with
+# `--ref <that branch>` after merging.
+name: Charts Public Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      charts:
+        description: 'Charts to release (space-separated)'
+        required: false
+        default: 'tfy-llm-gateway'
+        type: string
+
+env:
+  RELEASE_CHARTS: tfy-llm-gateway
+  # Override via repo variable INFRA_CHARTS_REPO for sandbox/fork testing.
+  INFRA_REPO: ${{ vars.INFRA_CHARTS_REPO || 'truefoundry/infra-charts' }}
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  release_charts:
+    name: Release charts
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Detect charts to release
+        id: detect_charts
+        run: |
+          changed_charts="${{ github.event.inputs.charts }}"
+
+          charts_to_release=""
+          for chart in ${changed_charts}; do
+            case " ${RELEASE_CHARTS} " in
+              *" ${chart} "*)
+                charts_to_release="${charts_to_release} ${chart}"
+                ;;
+            esac
+          done
+
+          charts_to_release=$(echo "${charts_to_release}" | xargs)
+          if [ -z "${charts_to_release}" ]; then
+            echo "No release charts selected."
+            echo "charts_to_release=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          version_summary=""
+          branch_suffix=""
+          for chart in ${charts_to_release}; do
+            version=$(awk '/^version:/ {print $2; exit}' "./charts/${chart}/Chart.yaml")
+            version_summary="${version_summary}${chart}-${version} "
+            branch_suffix="${branch_suffix}${chart}-${version}-"
+          done
+
+          branch_suffix=$(echo "${branch_suffix}" | sed 's/-*$//')
+          version_summary=$(echo "${version_summary}" | xargs)
+
+          echo "charts_to_release=${charts_to_release}" >> "$GITHUB_OUTPUT"
+          echo "branch_suffix=${branch_suffix}" >> "$GITHUB_OUTPUT"
+          echo "version_summary=${version_summary}" >> "$GITHUB_OUTPUT"
+
+      - name: Ensure infra-charts branch exists
+        if: steps.detect_charts.outputs.charts_to_release != ''
+        env:
+          GH_TOKEN: ${{ secrets.TF_GITHUB_CI_ADMIN_TOKEN }}
+          INFRA_BRANCH: ${{ steps.detect_charts.outputs.branch_suffix }}
+        run: |
+          if gh api "repos/${INFRA_REPO}/git/ref/heads/${INFRA_BRANCH}" >/dev/null 2>&1; then
+            echo "${INFRA_BRANCH} already exists in ${INFRA_REPO}"
+            exit 0
+          fi
+          MAIN_SHA=$(gh api "repos/${INFRA_REPO}/git/ref/heads/main" --jq .object.sha)
+          gh api "repos/${INFRA_REPO}/git/refs" --method POST \
+            -f "ref=refs/heads/${INFRA_BRANCH}" -f "sha=${MAIN_SHA}"
+          echo "Created ${INFRA_BRANCH} in ${INFRA_REPO} from main"
+
+      - name: Checkout charts
+        if: steps.detect_charts.outputs.charts_to_release != ''
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.INFRA_CHARTS_REPO || 'truefoundry/infra-charts' }}
+          ref: ${{ steps.detect_charts.outputs.branch_suffix }}
+          token: ${{ secrets.TF_GITHUB_CI_ADMIN_TOKEN }}
+          path: tmp_ahc
+
+      - name: Copy charts
+        if: steps.detect_charts.outputs.charts_to_release != ''
+        run: |
+          for chart in ${{ steps.detect_charts.outputs.charts_to_release }}; do
+            rm -rf "./tmp_ahc/charts/${chart}"
+            cp -r "./charts/${chart}" ./tmp_ahc/charts/
+          done
+
+      - name: Set up Helm
+        if: steps.detect_charts.outputs.charts_to_release != ''
+        uses: azure/setup-helm@v4.3.0
+        with:
+          version: v3.17.3
+
+      - name: Update Helm dependencies
+        if: steps.detect_charts.outputs.charts_to_release != ''
+        run: |
+          for chart in ${{ steps.detect_charts.outputs.charts_to_release }}; do
+            helm dependency update "./tmp_ahc/charts/${chart}"
+          done
+
+      - name: Create Pull Request
+        if: steps.detect_charts.outputs.charts_to_release != ''
+        uses: peter-evans/create-pull-request@v7
+        with:
+          commit-message: '[CI] Publish charts ${{ steps.detect_charts.outputs.version_summary }}'
+          branch: charts-${{ steps.detect_charts.outputs.branch_suffix }}
+          base: ${{ steps.detect_charts.outputs.branch_suffix }}
+          path: tmp_ahc
+          title: '[CI] Publish charts ${{ steps.detect_charts.outputs.version_summary }}'
+          body: |
+            Copies ${{ steps.detect_charts.outputs.version_summary }} from `truefoundry/helm-charts` into `charts/`, on infra-charts branch `${{ steps.detect_charts.outputs.branch_suffix }}` (not main — see this workflow's header comment).
+
+            ---
+            Source: `truefoundry/helm-charts` workflow `.github/workflows/release-public-charts.yaml`
+            Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          token: ${{ secrets.TF_GITHUB_CI_ADMIN_TOKEN }}

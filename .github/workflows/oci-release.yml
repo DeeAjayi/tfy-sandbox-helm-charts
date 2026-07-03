@@ -1,0 +1,74 @@
+name: Release OCI Charts
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - "release-v*"
+      - "!release-v*-rc*"
+    paths:
+      - "charts/*/Chart.yaml"
+
+env:
+  # Registry host/repo overridable via repo variables for sandbox/fork
+  # testing (e.g. ghcr.io + <owner>/charts); defaults preserve prod.
+  JFROG_REPOSITORY: ${{ vars.OCI_HELM_REPOSITORY || 'tfy-helm' }}
+  QUAY_REPOSITORY: truefoundrycharts
+  QUAY_REGISTRY: quay.io
+  JFROG_REGISTRY: ${{ vars.OCI_HELM_REGISTRY || 'tfy.jfrog.io' }}
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: JFrog helm registry login
+        run: |
+          helm registry login -u ${{ secrets.TRUEFOUNDRY_ARTIFACTORY_PUBLIC_USERNAME }} -p ${{ secrets.TRUEFOUNDRY_ARTIFACTORY_PUBLIC_PASSWORD }} $JFROG_REGISTRY
+
+      - name: Helm push
+        run: |
+          cd charts
+          for CHART_DIR in $(ls -d */); do
+              CHART_DIR=$(basename "$CHART_DIR")
+              echo "CHARTDIR: $CHART_DIR/Chart.yaml"
+          
+              # getting chart name and version
+              CHART_NAME=$(yq '.name' "$CHART_DIR/Chart.yaml")
+              CHART_VERSION=$(yq '.version' "$CHART_DIR/Chart.yaml")
+
+              if helm pull oci://$JFROG_REGISTRY/$JFROG_REPOSITORY/$CHART_NAME --version $CHART_VERSION >/dev/null 2>&1; then
+                echo "$CHART_NAME already found for version $CHART_VERSION. Skipping..."
+                continue
+              fi
+          
+              # packaging chart
+              # A standalone subchart (e.g. tfy-llm-gateway) is published by a
+              # separate workflow on the same release-branch push, so it may still
+              # be publishing to OCI when this runs. Retry the dependency update so
+              # we wait for it to become available instead of failing the race.
+              attempt=0
+              max_attempts=20
+              until helm dependency update "$CHART_DIR"; do
+                attempt=$((attempt + 1))
+                if [ "$attempt" -ge "$max_attempts" ]; then
+                  echo "::error::helm dependency update failed for $CHART_DIR after $attempt attempts" >&2
+                  exit 1
+                fi
+                echo "dependency update failed (attempt $attempt/$max_attempts); retrying in 15s..."
+                sleep 15
+              done
+              helm package "$CHART_DIR"
+
+              # pushing the helm chart
+              echo "Pushing Chart: $CHART_NAME"
+              echo "Version: $CHART_NAME-$CHART_VERSION.tgz"
+
+              # push to tfy.jfrog.io
+              helm push "$CHART_NAME-$CHART_VERSION.tgz" oci://$JFROG_REGISTRY/$JFROG_REPOSITORY
+              echo "Successfully pushed chart: $CHART_NAME"
+          done

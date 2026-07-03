@@ -1,0 +1,30 @@
+# Sandbox component map — two stub repos standing in for the real service
+# fleet. Same schema as prod's config/components.yml.
+repositories:
+  - repository: DeeAjayi/tfy-sandbox-service
+    helm_subpath: sandboxService
+    env_helm_path: ""
+    build:
+      workflow_files:
+        - build-n-publish-release.yml
+      dockerfile: Dockerfile
+      image_artifact_name: tfy-sandbox-service
+      registry: artifactory_private
+
+  # Stands in for truefoundry/tfy-llm-gateway: an independently-versioned,
+  # independently-published subchart the umbrella depends on from OCI.
+  - repository: DeeAjayi/tfy-sandbox-gateway
+    subchart:
+      name: tfy-llm-gateway
+      values_file: charts/tfy-llm-gateway/values.yaml
+      image_path: image
+      chart_file: charts/tfy-llm-gateway/Chart.yaml
+      published: true
+      global_version_key: gatewayChartVersion
+    env_helm_path: ""
+    build:
+      workflow_files:
+        - build-n-publish-release.yml
+      dockerfile: Dockerfile
+      image_artifact_name: tfy-sandbox-gateway
+      registry: artifactory_private

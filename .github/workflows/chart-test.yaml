@@ -1,0 +1,30 @@
+# Simplified sandbox version of prod's chart-test.yaml (which uses
+# chart-testing + full template rendering). Keeps the same trigger shape and
+# the same job name (helm_test) so it exercises the wait_for_checks.py gating
+# in release-helm-update.yml exactly like prod's check does.
+name: Lint and Test Helm Charts
+
+on:
+  pull_request:
+    branches:
+      - "release-v*.*.0"
+    paths:
+      - 'charts/truefoundry/**'
+      - 'charts/tfy-llm-gateway/**'
+      - '.github/workflows/chart-test.yaml'
+
+jobs:
+  helm_test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4.3.0
+        with:
+          version: v3.18.2
+
+      - name: Helm lint
+        run: |
+          helm lint charts/truefoundry
+          helm lint charts/tfy-llm-gateway

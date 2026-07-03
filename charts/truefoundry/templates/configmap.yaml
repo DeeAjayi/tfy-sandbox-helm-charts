@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: truefoundry-sandbox
+data:
+  controlPlaneChartVersion: {{ .Values.global.controlPlaneChartVersion | quote }}
+  sandboxServiceImage: "{{ .Values.sandboxService.image.repository }}:{{ .Values.sandboxService.image.tag }}"

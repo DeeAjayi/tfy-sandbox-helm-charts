@@ -1,0 +1,113 @@
+# Packages the listed chart(s) and pushes them to the public JFrog Artifactory
+# OCI registries (TRUEFOUNDRY_ARTIFACTORY_PUBLIC_HELM_REGISTRY and, if set,
+# the inframold registry), via scripts/artifactory-chart-releaser/main.py.
+# Skips a chart/version that's already published.
+#
+# Triggers at the RELEASE-BRANCH level (mirrors oci-release.yml), not on
+# `main`: main is only fast-forwarded for a latest-line prod, so an RC or an
+# older-line hotfix never reaches it — gating this on main would mean those
+# never get published at all. Publishing off the release branch instead means
+# every kind (rc/prod/hotfix) reaches the registry as soon as its chart PR
+# merges into release-vX.Y.Z, regardless of whether/when that line ever
+# promotes to main. git tags/releases are unaffected either way — those are
+# created independently by release-publish-releases.yml.
+name: Release charts to public artifactory
+
+on:
+  push:
+    branches:
+      - "release-v*"
+      - "!release-v*-rc*"
+    paths:
+      - 'charts/tfy-llm-gateway/**'
+  workflow_dispatch:
+    inputs:
+      charts:
+        description: 'Charts to release (space-separated)'
+        required: false
+        default: 'tfy-llm-gateway'
+        type: string
+
+env:
+  ARTIFACTORY_REGISTRY: ${{ vars.TRUEFOUNDRY_ARTIFACTORY_REGISTRY_URL }}
+  ARTIFACTORY_USERNAME: ${{ secrets.TRUEFOUNDRY_ARTIFACTORY_PUBLIC_USERNAME }}
+  ARTIFACTORY_PASSWORD: ${{ secrets.TRUEFOUNDRY_ARTIFACTORY_PUBLIC_PASSWORD }}
+  ARTIFACTORY_REPOSITORY_URL: ${{ vars.TRUEFOUNDRY_ARTIFACTORY_PUBLIC_HELM_REGISTRY }}
+  INFRAMOLD_ARTIFACTORY_REPOSITORY_URL: ${{ vars.TRUEFOUNDRY_ARTIFACTORY_INFRAMOLD_PUBLIC_HELM_REGISTRY }}
+  RELEASE_CHARTS: tfy-llm-gateway
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Detect charts to release
+        id: detect_charts
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            changed_charts="${{ github.event.inputs.charts }}"
+          else
+            # Push trigger: the path filter above already guarantees
+            # charts/tfy-llm-gateway/** changed, so just publish it directly
+            # rather than re-deriving that from the diff.
+            changed_charts="${RELEASE_CHARTS}"
+          fi
+
+          charts_to_release=""
+          for chart in ${changed_charts}; do
+            case " ${RELEASE_CHARTS} " in
+              *" ${chart} "*)
+                charts_to_release="${charts_to_release} ${chart}"
+                ;;
+            esac
+          done
+
+          charts_to_release=$(echo "${charts_to_release}" | xargs)
+          echo "charts_to_release=${charts_to_release}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Helm
+        if: steps.detect_charts.outputs.charts_to_release != ''
+        uses: azure/setup-helm@v4.3.0
+        with:
+          version: v3.17.3
+
+      - name: Add helm dependencies and update
+        if: steps.detect_charts.outputs.charts_to_release != ''
+        run: |
+          helm repo add grafana https://grafana.github.io/helm-charts
+          helm repo add clickhouse-operator https://docs.altinity.com/clickhouse-operator
+          helm repo add nvidia https://helm.ngc.nvidia.com/nvidia
+          helm repo add dcgm-exporter https://nvidia.github.io/dcgm-exporter/helm-charts
+          helm repo add truefoundry https://truefoundry.github.io/infra-charts
+          helm repo add nats https://nats-io.github.io/k8s/helm/charts/
+          helm repo add bitnami https://charts.bitnami.com/bitnami
+          helm repo add headlamp https://kubernetes-sigs.github.io/headlamp/
+          helm repo add external-secrets https://charts.external-secrets.io
+          helm repo update
+
+      - name: Helm registry login
+        if: steps.detect_charts.outputs.charts_to_release != ''
+        run: |
+          helm registry login ${{ env.ARTIFACTORY_REGISTRY }} -u ${{ env.ARTIFACTORY_USERNAME }} -p ${{ env.ARTIFACTORY_PASSWORD }}
+
+      - name: Set up Python
+        if: steps.detect_charts.outputs.charts_to_release != ''
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install python dependencies
+        if: steps.detect_charts.outputs.charts_to_release != ''
+        run: |
+          pip install -r scripts/artifactory-chart-releaser/requirements.txt
+
+      - name: Publish helm charts
+        if: steps.detect_charts.outputs.charts_to_release != ''
+        env:
+          CHARTS_TO_RELEASE: ${{ steps.detect_charts.outputs.charts_to_release }}
+        run: |
+          python scripts/artifactory-chart-releaser/main.py

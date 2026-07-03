@@ -1,0 +1,183 @@
+name: Build services reusable
+
+on:
+  workflow_call:
+    inputs:
+      spec:
+        required: true
+        type: string
+    outputs:
+      tag_map:
+        description: Repo to tag map
+        value: ${{ jobs.summary.outputs.tag_map }}
+      commit_map:
+        description: Repo to commit map
+        value: ${{ jobs.summary.outputs.commit_map }}
+
+# Used by the callback step at the end of the summary job. GITHUB_RUN_ID is
+# the natural primary key; vars.* and secrets.* come from the caller via
+# `secrets: inherit`.
+env:
+  RELEASE_APP_BASE_URL:       ${{ vars.RELEASE_APP_BASE_URL }}
+  RELEASE_APP_CALLBACK_TOKEN: ${{ secrets.RELEASE_APP_CALLBACK_TOKEN }}
+
+jobs:
+  # Marks the build phase running immediately (runs in parallel with the matrix,
+  # so it doesn't delay anything) — gives release-app a real phase start time.
+  notify_start:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Notify release-app — build running
+        run: |
+          python3 scripts/release/callback.py \
+            --phase build --status running \
+            --spec '${{ inputs.spec }}'
+
+  legs:
+    # A chart-only hotfix has an empty repos list — GitHub Actions hard-errors
+    # ("Matrix must define at least one vector") on an empty matrix array
+    # rather than just skipping, so guard it explicitly.
+    if: ${{ toJson(fromJSON(inputs.spec).repos) != '[]' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        repo: ${{ fromJSON(inputs.spec).repos }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout helm-charts
+        uses: actions/checkout@v4
+
+      - name: Install python dependencies
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install pyyaml
+
+      - name: Resolve repo slug
+        id: slug
+        run: |
+          echo "value=$(echo '${{ matrix.repo }}' | tr '/' '__')" >> "$GITHUB_OUTPUT"
+
+      - name: Artifactory registry login (for pre-dispatch skip-check)
+        env:
+          ARTIFACTORY_PRIVATE_USERNAME: ${{ secrets.TRUEFOUNDRY_ARTIFACTORY_PRIVATE_USERNAME }}
+          ARTIFACTORY_PRIVATE_PASSWORD: ${{ secrets.TRUEFOUNDRY_ARTIFACTORY_PRIVATE_PASSWORD }}
+          # Login host derived from the private registry prefix so sandbox
+          # forks (e.g. ghcr.io/<owner>) work without editing this file.
+          REGISTRY_HOST: ${{ vars.TRUEFOUNDRY_ARTIFACTORY_PRIVATE_REPOSITORY || 'tfy.jfrog.io' }}
+        run: |
+          if [ -n "$ARTIFACTORY_PRIVATE_USERNAME" ] && [ -n "$ARTIFACTORY_PRIVATE_PASSWORD" ]; then
+            echo "$ARTIFACTORY_PRIVATE_PASSWORD" | docker login "${REGISTRY_HOST%%/*}" \
+              -u "$ARTIFACTORY_PRIVATE_USERNAME" --password-stdin
+          else
+            echo "Artifactory credentials unset; skip-check will fall through to dispatch."
+          fi
+
+      - name: Dispatch build-n-publish-release and wait
+        id: dispatch
+        env:
+          GH_TOKEN: ${{ secrets.TF_GITHUB_CI_ADMIN_TOKEN }}
+          ARTIFACTORY_PRIVATE_REGISTRY: ${{ vars.TRUEFOUNDRY_ARTIFACTORY_PRIVATE_REPOSITORY }}
+          ARTIFACTORY_PUBLIC_REGISTRY: ${{ vars.TRUEFOUNDRY_ARTIFACTORY_PUBLIC_REPOSITORY }}
+        run: |
+          python3 scripts/release/dispatch_build.py \
+            --spec '${{ inputs.spec }}' \
+            --repo '${{ matrix.repo }}' \
+            >> "$GITHUB_OUTPUT"
+
+      - name: Write build result artifact
+        env:
+          REPO: ${{ matrix.repo }}
+          TAG: ${{ steps.dispatch.outputs.tag }}
+          COMMIT_SHA: ${{ steps.dispatch.outputs.commit_sha }}
+          STATUS: ${{ steps.dispatch.outputs.status }}
+          UPDATE: ${{ steps.dispatch.outputs.update }}
+          PUBLISH: ${{ steps.dispatch.outputs.publish }}
+          CI_LINK: ${{ steps.dispatch.outputs.ci_link }}
+        run: |
+          mkdir -p result
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          payload = {
+              "repo": os.environ["REPO"],
+              "tag": os.environ["TAG"],
+              "commit_sha": os.environ["COMMIT_SHA"],
+              "status": os.environ.get("STATUS", ""),
+              "update": os.environ.get("UPDATE", "") == "true",
+              "publish": os.environ.get("PUBLISH", "") == "true",
+              "ci_link": os.environ.get("CI_LINK", ""),
+          }
+          Path("result/result.json").write_text(json.dumps(payload), encoding="utf-8")
+          PY
+
+      - name: Upload build result
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-result-${{ steps.slug.outputs.value }}
+          path: result/result.json
+
+  summary:
+    needs: legs
+    if: always()
+    runs-on: ubuntu-latest
+    outputs:
+      tag_map: ${{ steps.summary.outputs.tag_map }}
+      commit_map: ${{ steps.summary.outputs.commit_map }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        # A chart-only hotfix skips `legs` entirely (empty repos), so there
+        # are no build-result-* artifacts to find; don't fail the job over it
+        # — build_summary.py already tolerates a missing artifact-dir.
+        continue-on-error: true
+        with:
+          path: build-results
+          pattern: build-result-*
+          merge-multiple: false
+      - name: Install python dependencies
+        run: |
+          python3 -m pip install --upgrade pip
+      - id: summary
+        run: |
+          python3 scripts/release/build_summary.py \
+            --artifact-dir build-results \
+            --spec '${{ inputs.spec }}' \
+            >> "$GITHUB_OUTPUT"
+
+      # phase=build callback. Runs after the matrix completes (success OR
+      # failure — if: always() at the job level via the summary job's needs).
+      # `status` reflects the aggregate across legs: success only when every
+      # leg in spec.repos produced a result.
+      - name: Notify release-app — build
+        if: ${{ always() }}
+        env:
+          TAG_MAP:           ${{ steps.summary.outputs.tag_map }}
+          COMMIT_MAP:        ${{ steps.summary.outputs.commit_map }}
+          COMPONENT_UPDATES: ${{ steps.summary.outputs.component_updates }}
+          NEEDS_LEGS:        ${{ needs.legs.result }}
+        run: |
+          DATA=$(python3 -c "
+          import json, os
+          print(json.dumps({
+              'tag_map':    json.loads(os.environ.get('TAG_MAP')    or '{}'),
+              'commit_map': json.loads(os.environ.get('COMMIT_MAP') or '{}'),
+              'legs_result': os.environ.get('NEEDS_LEGS', ''),
+          }))
+          ")
+          # 'skipped' is a legitimate outcome for legs when spec.repos is empty
+          # (a chart-only hotfix) — not a failure.
+          LEGS='${{ needs.legs.result }}'
+          if [ "$LEGS" = "success" ] || [ "$LEGS" = "skipped" ]; then
+            STATUS="${{ steps.summary.outcome == 'success' && 'success' || 'failed' }}"
+          else
+            STATUS=failed
+          fi
+          python3 scripts/release/callback.py \
+            --phase build \
+            --status "$STATUS" \
+            --spec '${{ inputs.spec }}' \
+            --data "$DATA" \
+            --component-updates "${COMPONENT_UPDATES:-[]}"

@@ -1,0 +1,156 @@
+name: Publish releases reusable
+
+on:
+  workflow_call:
+    inputs:
+      spec:
+        required: true
+        type: string
+      tag_map:
+        required: true
+        type: string
+      commit_map:
+        required: true
+        type: string
+      merge_pr:
+        description: >-
+          Whether the chart PR is being merged this run. Per-service releases
+          are published regardless (the service images/commits are already
+          final); the chart's own tag + GitHub release is only published when
+          the chart PR is actually merged, so its tag points at the merged
+          commit. When false (review mode) the chart release is deferred.
+        required: false
+        type: boolean
+        default: true
+
+env:
+  RELEASE_APP_BASE_URL:       ${{ vars.RELEASE_APP_BASE_URL }}
+  RELEASE_APP_CALLBACK_TOKEN: ${{ secrets.RELEASE_APP_CALLBACK_TOKEN }}
+
+jobs:
+  # Marks the publish phase running immediately (parallel with the work jobs) so
+  # release-app gets a real phase start time from the callback.
+  notify_start:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Notify release-app — publish running
+        run: |
+          python3 scripts/release/callback.py \
+            --phase publish --status running \
+            --spec '${{ inputs.spec }}'
+
+  per_service:
+    # A chart-only hotfix has an empty repos list — GitHub Actions hard-errors
+    # ("Matrix must define at least one vector") on an empty matrix array
+    # rather than just skipping, so guard it explicitly.
+    if: ${{ toJson(fromJSON(inputs.spec).repos) != '[]' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        repo: ${{ fromJSON(inputs.spec).repos }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Publish service release tag and GitHub release
+        id: publish
+        env:
+          GH_TOKEN: ${{ secrets.TF_GITHUB_CI_ADMIN_TOKEN }}
+        run: |
+          python3 scripts/release/publish_releases.py per-service \
+            --spec '${{ inputs.spec }}' \
+            --tag-map '${{ inputs.tag_map }}' \
+            --commit-map '${{ inputs.commit_map }}' \
+            --repo '${{ matrix.repo }}'
+
+      # Forward this service's PRs + GitHub Release URL to release-app. The PRs
+      # are persisted into truefoundry_release_component_map keyed by
+      # (release, repository). Guarded on github_release_url so unchanged repos
+      # (no tag created → no output) don't emit an empty component update.
+      - name: Notify release-app — component PRs
+        if: ${{ always() && steps.publish.outputs.github_release_url != '' }}
+        env:
+          REPO:                ${{ matrix.repo }}
+          TAG_MAP:             ${{ inputs.tag_map }}
+          GITHUB_RELEASE_URL:  ${{ steps.publish.outputs.github_release_url }}
+          PULL_REQUESTS:       ${{ steps.publish.outputs.pull_requests }}
+        run: |
+          CU=$(python3 -c "
+          import json, os
+          repo = os.environ['REPO']
+          tag  = (json.loads(os.environ.get('TAG_MAP') or '{}')).get(repo, '')
+          prs  = json.loads(os.environ.get('PULL_REQUESTS') or '[]')
+          print(json.dumps([{
+              'repository':         repo,
+              'status':             'success',
+              'tag':                tag,
+              'github_release_url': os.environ.get('GITHUB_RELEASE_URL') or '',
+              'pull_requests':      prs,
+          }]))
+          ")
+          python3 scripts/release/callback.py \
+            --phase publish --status running \
+            --spec '${{ inputs.spec }}' \
+            --component-updates "$CU"
+
+  helm_charts_release:
+    needs: per_service
+    # Only publish the chart tag/release once the chart PR is actually merged —
+    # its tag must point at the merged chart commit. In review mode (merge_pr
+    # off) this is deferred; per-service releases above still run.
+    # per_service is legitimately 'skipped' (not failed) for a chart-only
+    # hotfix (empty repos) — the chart must still get tagged/released in
+    # that case, so explicitly allow skipped through here.
+    if: >-
+      ${{ inputs.merge_pr &&
+          (needs.per_service.result == 'success' || needs.per_service.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Publish helm-charts release
+        env:
+          GH_TOKEN: ${{ secrets.TF_GITHUB_CI_ADMIN_TOKEN }}
+        run: |
+          python3 scripts/release/publish_releases.py helm-charts \
+            --spec '${{ inputs.spec }}' \
+            --tag-map '${{ inputs.tag_map }}' \
+            --commit-map '${{ inputs.commit_map }}'
+
+  # Aggregates publish results into a single phase=publish callback. Runs
+  # always() so failures in either per_service or helm_charts_release surface
+  # as a failed callback rather than being lost to GHA's UI.
+  notify_publish:
+    needs:
+      - per_service
+      - helm_charts_release
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Notify release-app — publish
+        env:
+          PER_SERVICE_RESULT: ${{ needs.per_service.result }}
+          HELM_CHARTS_RESULT: ${{ needs.helm_charts_release.result }}
+        run: |
+          # success iff both child jobs succeeded; any failure / cancelled flips
+          # to failed. Skipped is treated as success because matrix-with-zero
+          # repos legitimately skips per_service (none of the legs ran).
+          STATUS=success
+          for r in "$PER_SERVICE_RESULT" "$HELM_CHARTS_RESULT"; do
+            case "$r" in
+              success|skipped) ;;
+              *) STATUS=failed ;;
+            esac
+          done
+          DATA=$(python3 -c "
+          import json, os
+          print(json.dumps({
+              'per_service_result': os.environ.get('PER_SERVICE_RESULT', ''),
+              'helm_charts_result': os.environ.get('HELM_CHARTS_RESULT', ''),
+          }))
+          ")
+          python3 scripts/release/callback.py \
+            --phase publish \
+            --status "$STATUS" \
+            --spec '${{ inputs.spec }}' \
+            --data "$DATA"
