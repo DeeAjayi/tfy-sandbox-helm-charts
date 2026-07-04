@@ -114,6 +114,21 @@ jobs:
           cp -r ./charts/truefoundry ./tmp_ahc/charts/
           cp -r ./charts/tfy-llm-gateway ./tmp_ahc/charts/
 
+      # The umbrella's tfy-llm-gateway dependency resolves from an OCI
+      # registry; prod's is anonymously pullable but a fork/sandbox registry
+      # (e.g. private GHCR packages) may not be — log in when creds exist.
+      - name: Helm registry login (for OCI chart dependencies)
+        env:
+          REGISTRY_HOST: ${{ vars.TRUEFOUNDRY_ARTIFACTORY_REGISTRY_URL }}
+          REGISTRY_USER: ${{ secrets.TRUEFOUNDRY_ARTIFACTORY_PUBLIC_USERNAME }}
+          REGISTRY_PASS: ${{ secrets.TRUEFOUNDRY_ARTIFACTORY_PUBLIC_PASSWORD }}
+        run: |
+          if [ -n "$REGISTRY_HOST" ] && [ -n "$REGISTRY_USER" ]; then
+            helm registry login "$REGISTRY_HOST" -u "$REGISTRY_USER" -p "$REGISTRY_PASS"
+          else
+            echo "Registry host/creds unset; relying on anonymous pulls."
+          fi
+
       - name: Update Helm dependencies for Truefoundry chart
         run: |
           helm dependency update ./tmp_ahc/charts/truefoundry
