@@ -1,5 +1,5 @@
 global:
-  controlPlaneChartVersion: "0.5.1"
+  controlPlaneChartVersion: "0.5.2"
 
 # test chart
 tfy-llm-gateway:
