@@ -1,0 +1,70 @@
+name: Wait for PR merged
+
+# Reusable helper: poll a PR until it is MERGED (not merely closed), or fail on
+# timeout. Used by every stage that creates a PR so "confirm-then-exit" means
+# "confirm merged". See release-app design-docs/release/release-end-to-end.md §11.
+
+on:
+  workflow_call:
+    inputs:
+      repo:
+        description: "owner/name of the repo containing the PR"
+        required: true
+        type: string
+      pr_number:
+        description: "PR number to wait on"
+        required: true
+        type: string
+      timeout_seconds:
+        required: false
+        type: number
+        default: 1800
+      poll_seconds:
+        required: false
+        type: number
+        default: 15
+  workflow_dispatch:
+    inputs:
+      repo:
+        required: true
+        type: string
+      pr_number:
+        required: true
+        type: string
+      timeout_seconds:
+        required: false
+        type: number
+        default: 1800
+      poll_seconds:
+        required: false
+        type: number
+        default: 15
+
+jobs:
+  wait:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Poll until PR is merged
+        env:
+          GH_TOKEN: ${{ secrets.TF_GITHUB_CI_ADMIN_TOKEN }}
+        run: |
+          set -euo pipefail
+          deadline=$(( $(date +%s) + ${{ inputs.timeout_seconds }} ))
+          while :; do
+            merged=$(gh pr view "${{ inputs.pr_number }}" -R "${{ inputs.repo }}" --json merged --jq '.merged' || echo "error")
+            state=$(gh pr view "${{ inputs.pr_number }}" -R "${{ inputs.repo }}" --json state --jq '.state' || echo "")
+            echo "PR ${{ inputs.repo }}#${{ inputs.pr_number }}: merged=$merged state=$state"
+            if [ "$merged" = "true" ]; then
+              echo "PR merged."; exit 0
+            fi
+            # A PR closed WITHOUT merging is a hard failure (someone declined it).
+            if [ "$state" = "CLOSED" ] && [ "$merged" = "false" ]; then
+              echo "::error::PR ${{ inputs.repo }}#${{ inputs.pr_number }} was CLOSED without merging."
+              exit 1
+            fi
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::error::PR ${{ inputs.repo }}#${{ inputs.pr_number }} not merged within ${{ inputs.timeout_seconds }}s."
+              exit 1
+            fi
+            sleep "${{ inputs.poll_seconds }}"
+          done

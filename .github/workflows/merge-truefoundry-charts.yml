@@ -1,0 +1,111 @@
+name: Confirm truefoundry charts landed (infra-charts)
+
+# Under the release-branch model (release-public-truefoundry.yaml), the
+# infra-charts copy PR ("[CI] Publish truefoundry to version X", head
+# truefoundry-version-X, base release/truefoundry-X) is opened AND auto-merged
+# by the pipeline itself, gated on its checks — this tail stage no longer
+# merges anything. It CONFIRMS the copy landed:
+#
+#   1. If the copy PR is still open (pipeline mid-merge or died), wait for it.
+#   2. Verify release/truefoundry-<version> actually carries the version.
+#   3. Emit tfy-llm-gateway's OWN chart version (it is versioned
+#      independently of truefoundry) for the downstream gh-pages
+#      verification stage.
+#
+# Keeps the `infra_truefoundry` callback phase so release-app's stage
+# tracking is unchanged.
+#
+# NOTE: this is the control-plane chart copy into infra-charts; prod itself
+# pulls truefoundry from OCI (published by the `publish` phase), not from
+# this branch.
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        required: true
+        type: string
+    outputs:
+      gateway_version:
+        description: "tfy-llm-gateway's own chart version on the release branch"
+        value: ${{ jobs.confirm.outputs.gateway_version }}
+  workflow_dispatch:
+    inputs:
+      version:
+        required: true
+        type: string
+
+env:
+  RELEASE_APP_BASE_URL: ${{ vars.RELEASE_APP_BASE_URL }}
+  RELEASE_APP_CALLBACK_TOKEN: ${{ secrets.RELEASE_APP_CALLBACK_TOKEN }}
+  # Override via repo variable INFRA_CHARTS_REPO for sandbox/fork testing.
+  INFRA_REPO: ${{ vars.INFRA_CHARTS_REPO || 'truefoundry/infra-charts' }}
+
+jobs:
+  confirm:
+    runs-on: ubuntu-latest
+    outputs:
+      gateway_version: ${{ steps.verify.outputs.gateway_version }}
+    env:
+      GH_TOKEN: ${{ secrets.TF_GITHUB_CI_ADMIN_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Notify running
+        run: |
+          python3 scripts/release/callback.py --phase infra_truefoundry --status running
+
+      - name: Wait for the pipeline's copy PR to merge
+        id: find
+        run: |
+          set -euo pipefail
+          BRANCH="truefoundry-version-${{ inputs.version }}"
+          # Any state: the pipeline usually merged it long before the tail runs.
+          PR_JSON=$(gh pr list -R "$INFRA_REPO" --head "$BRANCH" --state all \
+            --json number,state,mergedAt --jq 'sort_by(.number) | last // empty')
+          if [ -z "$PR_JSON" ]; then
+            # A re-run after the copy already landed produces NO PR at all
+            # (peter-evans/create-pull-request finds no diff) — not an error;
+            # the branch verification below is the real gate.
+            echo "no copy PR with head $BRANCH in $INFRA_REPO; relying on branch verification."
+            echo "pr_url=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          NUM=$(jq -r '.number' <<<"$PR_JSON")
+          STATE=$(jq -r '.state' <<<"$PR_JSON")
+          echo "pr_url=https://github.com/$INFRA_REPO/pull/$NUM" >> "$GITHUB_OUTPUT"
+          case "$STATE" in
+            MERGED) echo "copy PR #$NUM already merged." ;;
+            OPEN)
+              # The pipeline merges this PR itself (checks-gated); just wait.
+              python3 scripts/release/wait_for_merge.py --repo "$INFRA_REPO" --head-branch "$BRANCH"
+              ;;
+            *)
+              echo "::error::copy PR #$NUM is $STATE without merging — re-run release-public-truefoundry.yaml for ${{ inputs.version }}"
+              exit 1
+              ;;
+          esac
+
+      - name: Verify release branch carries the version
+        id: verify
+        run: |
+          set -euo pipefail
+          REF="release/truefoundry-${{ inputs.version }}"
+          TF_VER=$(gh api "repos/$INFRA_REPO/contents/charts/truefoundry/Chart.yaml?ref=$REF" \
+            --jq .content | base64 -d | yq e '.version' -)
+          if [ "$TF_VER" != "${{ inputs.version }}" ]; then
+            echo "::error::$REF has truefoundry version $TF_VER, expected ${{ inputs.version }}"
+            exit 1
+          fi
+          GATEWAY_VERSION=$(gh api "repos/$INFRA_REPO/contents/charts/tfy-llm-gateway/Chart.yaml?ref=$REF" \
+            --jq .content | base64 -d | yq e '.version' -)
+          echo "truefoundry $TF_VER + tfy-llm-gateway $GATEWAY_VERSION confirmed on $REF"
+          echo "gateway_version=$GATEWAY_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Notify result
+        if: ${{ always() }}
+        run: |
+          python3 scripts/release/callback.py \
+            --phase infra_truefoundry \
+            --status "${{ job.status == 'success' && 'success' || 'failed' }}" \
+            --data '{"pr_url": "${{ steps.find.outputs.pr_url }}"}'

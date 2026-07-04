@@ -1,0 +1,133 @@
+name: Merge inframold PR (released last)
+
+# Merges the HELD infra-charts inframold PR (#2928, branch inframold-<version>)
+# AFTER the gateway rollout. Waits for "Generate Inframold Charts Artifacts
+# Manifest" to complete first so auto-merge doesn't race the bot's commit.
+# See design-docs §4 stage 7 + §11 rule 6.
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: "inframold chartVersion, e.g. 0.1.304"
+        required: true
+        type: string
+      timeout_seconds:
+        required: false
+        type: number
+        default: 1800
+  workflow_dispatch:
+    inputs:
+      version:
+        required: true
+        type: string
+      timeout_seconds:
+        required: false
+        type: number
+        default: 1800
+
+env:
+  RELEASE_APP_BASE_URL: ${{ vars.RELEASE_APP_BASE_URL }}
+  RELEASE_APP_CALLBACK_TOKEN: ${{ secrets.RELEASE_APP_CALLBACK_TOKEN }}
+  # Override via repo variable INFRA_CHARTS_REPO for sandbox/fork testing.
+  INFRA_REPO: ${{ vars.INFRA_CHARTS_REPO || 'truefoundry/infra-charts' }}
+  ARTIFACTS_WORKFLOW: "Generate Inframold Charts Artifacts Manifest"
+
+jobs:
+  merge:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.TF_GITHUB_CI_ADMIN_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Notify running
+        run: python3 scripts/release/callback.py --phase infra_inframold --status running
+
+      - name: Find held inframold PR
+        id: find
+        run: |
+          set -euo pipefail
+          BRANCH="inframold-${{ inputs.version }}"
+          # POLL rather than a one-shot lookup: the PR is opened
+          # asynchronously by publish-inframold-charts.yaml after
+          # inframold-promote's develop->main merge — a chained run (e.g.
+          # release-tail right after promote) usually gets here before it
+          # exists. 10-minute budget, generous for a cookiecutter publish.
+          deadline=$(( $(date +%s) + 600 ))
+          PR=""
+          while :; do
+            PR=$(gh pr list -R "$INFRA_REPO" --head "$BRANCH" --state open --json number --jq '.[0].number' || echo "")
+            if [ -n "$PR" ] && [ "$PR" != "null" ]; then break; fi
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::error::no open inframold PR ($BRANCH) appeared in $INFRA_REPO within 10m"; exit 1
+            fi
+            echo "inframold PR ($BRANCH) not open yet; waiting..."
+            sleep 15
+          done
+          echo "pr_number=$PR" >> "$GITHUB_OUTPUT"
+          echo "pr_url=https://github.com/$INFRA_REPO/pull/$PR" >> "$GITHUB_OUTPUT"
+
+      # #2928 was held open across the gateway rollout, so infra-charts main may
+      # have moved (e.g. #2926). Update the PR branch with base first; this may
+      # push a new head commit, which is why the artifacts-manifest wait below
+      # re-resolves the head SHA afterwards. "already up to date" is not an error.
+      - name: Update PR branch with base (rebase on moved main)
+        run: |
+          set -uo pipefail
+          gh pr update-branch "${{ steps.find.outputs.pr_number }}" -R "$INFRA_REPO" \
+            || echo "update-branch: nothing to do or already current"
+          sleep 5
+
+      - name: Wait for artifacts-manifest workflow on the PR head
+        run: |
+          set -uo pipefail
+          deadline=$(( $(date +%s) + ${{ inputs.timeout_seconds }} ))
+          SHA=""
+          while :; do
+            # Re-resolve the PR head EVERY iteration: update-branch above (or
+            # the manifest bot itself) can push a new head commit mid-wait,
+            # and check-runs are per commit — pinning the first SHA could let
+            # a stale commit's successful run satisfy the wait while the
+            # CURRENT head has no passing run yet.
+            CUR=$(gh pr view "${{ steps.find.outputs.pr_number }}" -R "$INFRA_REPO" --json headRefOid --jq '.headRefOid')
+            if [ "$CUR" != "$SHA" ]; then
+              [ -n "$SHA" ] && echo "PR head moved ${SHA:0:8} -> ${CUR:0:8}; restarting the wait"
+              SHA="$CUR"
+              echo "PR head SHA: $SHA ; waiting for '$ARTIFACTS_WORKFLOW'"
+            fi
+            concl=$(gh api "repos/$INFRA_REPO/commits/$SHA/check-runs" \
+              --jq "[.check_runs[] | select(.name | test(\"$ARTIFACTS_WORKFLOW\"; \"i\"))] | last | .conclusion" 2>/dev/null || echo "")
+            echo "conclusion=$concl"
+            if [ "$concl" = "success" ]; then
+              # Only accept if the validated commit is STILL the PR head.
+              FINAL=$(gh pr view "${{ steps.find.outputs.pr_number }}" -R "$INFRA_REPO" --json headRefOid --jq '.headRefOid')
+              [ "$FINAL" = "$SHA" ] && break
+              echo "head moved after success on ${SHA:0:8}; re-validating"; continue
+            fi
+            if [ "$concl" = "failure" ] || [ "$concl" = "cancelled" ] || [ "$concl" = "timed_out" ]; then
+              echo "::error::'$ARTIFACTS_WORKFLOW' concluded '$concl'"; exit 1
+            fi
+            [ "$(date +%s)" -ge "$deadline" ] && { echo "::error::timed out waiting for '$ARTIFACTS_WORKFLOW'"; exit 1; }
+            sleep 15
+          done
+
+      - name: Merge (admin) + confirm
+        run: |
+          set -euo pipefail
+          # The artifacts-manifest wait above covers ONE named check; gate the
+          # admin merge on ALL checks passing (same hardened gate as every
+          # other pipeline merge) so an unrelated failing/in-progress check on
+          # the same commit can't be merged past.
+          python3 scripts/release/wait_for_checks.py --repo "$INFRA_REPO" --head-branch "inframold-${{ inputs.version }}"
+          gh pr merge "${{ steps.find.outputs.pr_number }}" -R "$INFRA_REPO" --squash --admin --delete-branch
+          merged=$(gh pr view "${{ steps.find.outputs.pr_number }}" -R "$INFRA_REPO" --json merged --jq '.merged')
+          [ "$merged" = "true" ] || { echo "::error::inframold PR not merged"; exit 1; }
+
+      - name: Notify result
+        if: ${{ always() }}
+        run: |
+          python3 scripts/release/callback.py \
+            --phase infra_inframold \
+            --status "${{ job.status == 'success' && 'success' || 'failed' }}" \
+            --data '{"pr_url": "${{ steps.find.outputs.pr_url }}", "released": true}'

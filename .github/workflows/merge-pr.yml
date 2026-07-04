@@ -1,0 +1,124 @@
+name: Merge PR
+
+# Merge a cross-repo PR as truefoundry-saas using `gh pr merge --admin`
+# (bypasses branch protection / self-approval). Optionally waits for a named
+# workflow/check to complete on the PR first (e.g. infra-charts needs the
+# "Generate Inframold Charts Artifacts Manifest" run). Then waits until merged.
+# See design-docs §4 (merge engine) and §11 rule 6.
+
+on:
+  workflow_call:
+    inputs:
+      repo:
+        description: "owner/name"
+        required: true
+        type: string
+      pr_number:
+        required: true
+        type: string
+      method:
+        description: "merge | squash | rebase. develop->main MUST be 'merge'."
+        required: false
+        type: string
+        default: merge
+      wait_for_workflow:
+        description: "optional workflow/check name that must succeed on the PR before merging"
+        required: false
+        type: string
+        default: ""
+      timeout_seconds:
+        required: false
+        type: number
+        default: 1800
+  workflow_dispatch:
+    inputs:
+      repo:
+        required: true
+        type: string
+      pr_number:
+        required: true
+        type: string
+      method:
+        required: false
+        type: string
+        default: merge
+      wait_for_workflow:
+        required: false
+        type: string
+        default: ""
+      timeout_seconds:
+        required: false
+        type: number
+        default: 1800
+
+jobs:
+  merge:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.TF_GITHUB_CI_ADMIN_TOKEN }}
+    steps:
+      # wait_for_checks.py lives in this repo — the same hardened gate the
+      # core pipeline merges with (no-checks grace window, head-move
+      # re-resolution, startup_failure/stale treated as failures).
+      - uses: actions/checkout@v4
+
+      - name: Wait for required workflow/check on PR
+        if: ${{ inputs.wait_for_workflow != '' }}
+        run: |
+          set -uo pipefail
+          deadline=$(( $(date +%s) + ${{ inputs.timeout_seconds }} ))
+          SHA=""
+          while :; do
+            # Re-resolve the PR head EVERY iteration (same pattern as
+            # merge-inframold.yml): bots can push new head commits mid-wait,
+            # and check-runs are per commit — pinning the first SHA could let
+            # a stale commit's successful run satisfy the wait while the
+            # CURRENT head has no passing run yet.
+            CUR=$(gh pr view "${{ inputs.pr_number }}" -R "${{ inputs.repo }}" --json headRefOid --jq '.headRefOid')
+            if [ "$CUR" != "$SHA" ]; then
+              [ -n "$SHA" ] && echo "PR head moved ${SHA:0:8} -> ${CUR:0:8}; restarting the wait"
+              SHA="$CUR"
+              echo "PR head SHA: $SHA ; waiting for '${{ inputs.wait_for_workflow }}'"
+            fi
+            # TODO(review): match by check-run name OR actions run name; this checks check-runs.
+            concl=$(gh api "repos/${{ inputs.repo }}/commits/$SHA/check-runs" \
+              --jq "[.check_runs[] | select(.name | test(\"${{ inputs.wait_for_workflow }}\"; \"i\"))] | last | .conclusion" 2>/dev/null || echo "")
+            echo "check '${{ inputs.wait_for_workflow }}' conclusion=$concl"
+            if [ "$concl" = "success" ]; then
+              # Only accept if the validated commit is STILL the PR head.
+              FINAL=$(gh pr view "${{ inputs.pr_number }}" -R "${{ inputs.repo }}" --json headRefOid --jq '.headRefOid')
+              [ "$FINAL" = "$SHA" ] && break
+              echo "head moved after success on ${SHA:0:8}; re-validating"; continue
+            fi
+            if [ "$concl" = "failure" ] || [ "$concl" = "cancelled" ] || [ "$concl" = "timed_out" ]; then
+              echo "::error::required check '${{ inputs.wait_for_workflow }}' concluded '$concl'"; exit 1
+            fi
+            [ "$(date +%s)" -ge "$deadline" ] && { echo "::error::timed out waiting for '${{ inputs.wait_for_workflow }}'"; exit 1; }
+            sleep 15
+          done
+
+      # Same "checks must have actually passed" precondition as every merge in
+      # the core pipeline: an --admin merge bypasses branch protection, so
+      # nothing else stops a still-running or failed check from merging.
+      - name: Wait for ALL checks on the PR
+        run: |
+          set -euo pipefail
+          HEAD_BRANCH=$(gh pr view "${{ inputs.pr_number }}" -R "${{ inputs.repo }}" \
+            --json headRefName --jq '.headRefName')
+          python3 scripts/release/wait_for_checks.py \
+            --repo "${{ inputs.repo }}" \
+            --head-branch "$HEAD_BRANCH" \
+            --timeout-seconds "${{ inputs.timeout_seconds }}"
+
+      - name: Merge (admin)
+        run: |
+          set -euo pipefail
+          gh pr merge "${{ inputs.pr_number }}" -R "${{ inputs.repo }}" \
+            --${{ inputs.method }} --admin --delete-branch
+
+      - name: Confirm merged
+        run: |
+          set -euo pipefail
+          merged=$(gh pr view "${{ inputs.pr_number }}" -R "${{ inputs.repo }}" --json merged --jq '.merged')
+          [ "$merged" = "true" ] || { echo "::error::merge did not take effect"; exit 1; }
+          echo "Merged ${{ inputs.repo }}#${{ inputs.pr_number }}"

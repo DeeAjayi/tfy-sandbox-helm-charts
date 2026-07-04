@@ -1,0 +1,60 @@
+name: Purge FE cache
+
+# Cloudflare full purge of the prod frontend zone. Runs AFTER cp-prod deploy and
+# BEFORE gateway rollout (design-docs §5). Standalone + dispatchable.
+
+on:
+  workflow_call:
+    inputs:
+      zone_id:
+        required: false
+        type: string
+        default: "ca744bf29047a35767d6f62febc1a8c7"
+  workflow_dispatch:
+    inputs:
+      zone_id:
+        required: false
+        type: string
+        default: "ca744bf29047a35767d6f62febc1a8c7"
+
+env:
+  RELEASE_APP_BASE_URL: ${{ vars.RELEASE_APP_BASE_URL }}
+  RELEASE_APP_CALLBACK_TOKEN: ${{ secrets.RELEASE_APP_CALLBACK_TOKEN }}
+
+jobs:
+  purge:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Notify running
+        run: python3 scripts/release/callback.py --phase purge_cache --status running
+
+      - name: Purge Cloudflare cache (purge_everything)
+        env:
+          CLOUDFLARE_TOKEN: ${{ secrets.CLOUDFLARE_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Sandbox/fork friendliness: with no Cloudflare token there is no
+          # zone to purge — warn loudly and succeed so the rest of the tail
+          # can be exercised. Prod always has the secret set; a MISCONFIGURED
+          # token (set but invalid) still fails below.
+          if [ -z "${CLOUDFLARE_TOKEN:-}" ]; then
+            echo "::warning::CLOUDFLARE_TOKEN not set — skipping cache purge (sandbox/fork run)."
+            exit 0
+          fi
+          resp=$(curl -sS -X POST \
+            "https://api.cloudflare.com/client/v4/zones/${{ inputs.zone_id }}/purge_cache" \
+            -H "Authorization: Bearer ${CLOUDFLARE_TOKEN}" \
+            -H "Content-Type: application/json" \
+            --data '{"purge_everything": true}')
+          echo "$resp"
+          echo "$resp" | jq -e '.success == true' >/dev/null || {
+            echo "::error::Cloudflare purge failed"; exit 1; }
+
+      - name: Notify result
+        if: ${{ always() }}
+        run: |
+          python3 scripts/release/callback.py \
+            --phase purge_cache \
+            --status "${{ job.status == 'success' && 'success' || 'failed' }}"

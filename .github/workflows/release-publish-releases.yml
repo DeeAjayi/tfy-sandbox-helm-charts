@@ -22,6 +22,13 @@ on:
         required: false
         type: boolean
         default: true
+      allow_tag_move:
+        description: >-
+          Override the "fail loud if a tag exists at a different SHA" guard in
+          publish_releases.py (deliberate re-tag on a re-run). Default false.
+        required: false
+        type: boolean
+        default: false
 
 env:
   RELEASE_APP_BASE_URL:       ${{ vars.RELEASE_APP_BASE_URL }}
@@ -61,7 +68,8 @@ jobs:
             --spec '${{ inputs.spec }}' \
             --tag-map '${{ inputs.tag_map }}' \
             --commit-map '${{ inputs.commit_map }}' \
-            --repo '${{ matrix.repo }}'
+            --repo '${{ matrix.repo }}' \
+            ${{ inputs.allow_tag_move && '--allow-tag-move' || '' }}
 
       # Forward this service's PRs + GitHub Release URL to release-app. The PRs
       # are persisted into truefoundry_release_component_map keyed by
@@ -117,7 +125,8 @@ jobs:
           python3 scripts/release/publish_releases.py helm-charts \
             --spec '${{ inputs.spec }}' \
             --tag-map '${{ inputs.tag_map }}' \
-            --commit-map '${{ inputs.commit_map }}'
+            --commit-map '${{ inputs.commit_map }}' \
+            ${{ inputs.allow_tag_move && '--allow-tag-move' || '' }}
 
   # Aggregates publish results into a single phase=publish callback. Runs
   # always() so failures in either per_service or helm_charts_release surface

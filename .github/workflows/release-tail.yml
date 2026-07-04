@@ -1,0 +1,137 @@
+name: Release tail (end-to-end)
+
+# Runs the full post-core release "tail" in ONE dispatch, chaining the per-stage
+# reusable workflows in order:
+#
+#   confirm control-plane charts landed in infra-charts (the pipeline's
+#   release-branch flow merges them itself — see merge-truefoundry-charts.yml)
+#     → verify tfy-llm-gateway on gh-pages (at its OWN version)
+#     → purge Cloudflare FE cache
+#     → [run_gateway] gateway: dev → prod-canary → prod-all
+#     → inframold promote (bump chartVersion, develop→main, back-merge)
+#     → release inframold #2928 (rebased, after artifacts-manifest)
+#     → verify inframold published
+#
+# Run this AFTER cp-prod is live (the ubermold-truefoundry prod PR has been merged
+# and apply-tfy-prod succeeded — that human gate lives in release-start.yml).
+# release-app normally drives these stages individually (with per-stage go/no-go);
+# this workflow is the single-dispatch / fallback path. Each stage still self-gates
+# (chart availability, wait-until-merged) and posts best-effort callbacks.
+#
+# NOTE: this runs the stages back-to-back with no human pause between them. To
+# require approval before the prod gateway / inframold stages, protect a gate job
+# with a GitHub Environment (reusable-call jobs can't set `environment:` directly,
+# so add a small no-op gate job in front of the stage). Deferred for now.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Released chart version, e.g. 0.154.0 (no leading v)."
+        required: true
+        type: string
+      run_gateway:
+        description: "Run the LLM gateway rollout (dev → prod-canary → prod-all)."
+        required: false
+        type: boolean
+        default: true
+
+jobs:
+  merge_truefoundry_charts:
+    uses: ./.github/workflows/merge-truefoundry-charts.yml
+    with:
+      version: ${{ inputs.version }}
+    secrets: inherit
+
+  verify_gateway_chart:
+    needs: merge_truefoundry_charts
+    uses: ./.github/workflows/verify-chart-available.yml
+    with:
+      source_type: helm-repo
+      location: ${{ vars.INFRA_CHARTS_PAGES_URL || 'https://truefoundry.github.io/infra-charts' }}
+      chart: tfy-llm-gateway
+      # tfy-llm-gateway is versioned INDEPENDENTLY of truefoundry — verify at
+      # its own version (read off the release branch by the confirm stage),
+      # not at the truefoundry version.
+      version: ${{ needs.merge_truefoundry_charts.outputs.gateway_version }}
+      phase: verify_gateway_ghpages
+    secrets: inherit
+
+  purge_cache:
+    needs: verify_gateway_chart
+    uses: ./.github/workflows/purge-cache.yml
+    secrets: inherit
+
+  # The gateway rollout targets tfy-llm-gateway's OWN chart version (it is
+  # versioned independently of truefoundry), read off the release branch by
+  # the confirm stage — NOT the truefoundry version this workflow was
+  # dispatched with. Passing inputs.version here would poll gh-pages for a
+  # version that may not exist and pin the wrong chart in gitops.
+  gateway_dev:
+    needs: [merge_truefoundry_charts, purge_cache]
+    if: ${{ inputs.run_gateway }}
+    uses: ./.github/workflows/gateway-rollout.yml
+    with:
+      version: ${{ needs.merge_truefoundry_charts.outputs.gateway_version }}
+      environment: dev
+      canary: false
+    secrets: inherit
+
+  gateway_prod_canary:
+    needs: [merge_truefoundry_charts, gateway_dev]
+    if: ${{ inputs.run_gateway }}
+    uses: ./.github/workflows/gateway-rollout.yml
+    with:
+      version: ${{ needs.merge_truefoundry_charts.outputs.gateway_version }}
+      environment: prod
+      canary: true
+    secrets: inherit
+
+  gateway_prod:
+    needs: [merge_truefoundry_charts, gateway_prod_canary]
+    if: ${{ inputs.run_gateway }}
+    uses: ./.github/workflows/gateway-rollout.yml
+    with:
+      version: ${{ needs.merge_truefoundry_charts.outputs.gateway_version }}
+      environment: prod
+      canary: false
+    secrets: inherit
+
+  # truefoundry_version is the UNPREFIXED chart version (inputs.version) — the
+  # same format deploy.py writes into targetRevision (it lstrips the 'v' from
+  # spec.tag before touching any file), so the optional template bump in
+  # inframold-promote pins the identical revision format as the main path.
+  inframold_promote:
+    needs: [purge_cache, gateway_prod]
+    # Run after the gateway rollout completes, or right after purge when the
+    # gateway was INTENTIONALLY skipped (run_gateway=false). 'skipped' alone
+    # is not enough: when run_gateway=true and an EARLIER gateway stage fails,
+    # gateway_prod is also 'skipped' — that must block inframold, so tie the
+    # skip-acceptance to the run_gateway input.
+    if: >-
+      ${{ always()
+          && needs.purge_cache.result == 'success'
+          && ((inputs.run_gateway && needs.gateway_prod.result == 'success')
+              || (!inputs.run_gateway && needs.gateway_prod.result == 'skipped')) }}
+    uses: ./.github/workflows/inframold-promote.yml
+    with:
+      truefoundry_version: ${{ inputs.version }}
+    secrets: inherit
+
+  merge_inframold:
+    needs: inframold_promote
+    uses: ./.github/workflows/merge-inframold.yml
+    with:
+      version: ${{ needs.inframold_promote.outputs.inframold_version }}
+    secrets: inherit
+
+  verify_inframold:
+    needs: [inframold_promote, merge_inframold]
+    uses: ./.github/workflows/verify-chart-available.yml
+    with:
+      source_type: helm-repo
+      location: ${{ vars.INFRA_CHARTS_PAGES_URL || 'https://truefoundry.github.io/infra-charts' }}
+      chart: tfy-k8s-aws-eks-inframold
+      version: ${{ needs.inframold_promote.outputs.inframold_version }}
+      phase: verify_inframold
+    secrets: inherit

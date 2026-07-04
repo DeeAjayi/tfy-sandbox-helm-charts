@@ -1,0 +1,114 @@
+name: Gateway rollout (one stage)
+
+# One stage of the LLM gateway fleet rollout. Dispatches the gitops
+# update-tfy-llm-gateway-helm-version.yaml workflow, then merges the PR it opens
+# and confirms apply. Run 3x in order: dev (canary=false) -> prod canary=true ->
+# prod canary=false. See design-docs §4 stage 5 + §14 terminology.
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        required: true
+        type: string
+      environment:
+        description: "dev | prod"
+        required: true
+        type: string
+      canary:
+        required: false
+        type: boolean
+        default: false
+  workflow_dispatch:
+    inputs:
+      version:
+        required: true
+        type: string
+      environment:
+        required: true
+        type: string
+      canary:
+        required: false
+        type: boolean
+        default: false
+
+env:
+  RELEASE_APP_BASE_URL: ${{ vars.RELEASE_APP_BASE_URL }}
+  RELEASE_APP_CALLBACK_TOKEN: ${{ secrets.RELEASE_APP_CALLBACK_TOKEN }}
+  # Overridable for sandbox/fork testing (same pattern as INFRA_CHARTS_REPO).
+  GITOPS_REPO: ${{ vars.GITOPS_REPO || 'truefoundry/tfy-prod-k8s-gitops' }}
+  # gh-pages helm repo the gateway chart publishes to.
+  CHARTS_PAGES_URL: ${{ vars.INFRA_CHARTS_PAGES_URL || 'https://truefoundry.github.io/infra-charts' }}
+
+jobs:
+  rollout:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.TF_GITHUB_CI_ADMIN_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+
+      - name: Resolve callback phase
+        id: phase
+        run: |
+          if [ "${{ inputs.environment }}" = "dev" ]; then echo "phase=gateway_dev" >> "$GITHUB_OUTPUT";
+          elif [ "${{ inputs.canary }}" = "true" ]; then echo "phase=gateway_prod_canary" >> "$GITHUB_OUTPUT";
+          else echo "phase=gateway_prod" >> "$GITHUB_OUTPUT"; fi
+
+      - name: Notify running
+        run: python3 scripts/release/callback.py --phase "${{ steps.phase.outputs.phase }}" --status running
+
+      # Self-gate: the gateway chart must be live on gh-pages before we roll out.
+      - name: Verify tfy-llm-gateway available on gh-pages
+        run: |
+          set -uo pipefail
+          deadline=$(( $(date +%s) + 1200 ))
+          until helm repo add _v "$CHARTS_PAGES_URL" >/dev/null 2>&1 \
+                && helm repo update _v >/dev/null 2>&1 \
+                && helm search repo _v/tfy-llm-gateway --version "${{ inputs.version }}" | grep -q "${{ inputs.version }}"; do
+            [ "$(date +%s)" -ge "$deadline" ] && { echo "::error::tfy-llm-gateway ${{ inputs.version }} not on gh-pages"; exit 1; }
+            sleep 15
+          done
+
+      - name: Dispatch gitops update workflow
+        run: |
+          set -euo pipefail
+          gh workflow run update-tfy-llm-gateway-helm-version.yaml -R "$GITOPS_REPO" \
+            -f helm_chart_version="${{ inputs.version }}" \
+            -f environment="${{ inputs.environment }}" \
+            -f canary="${{ inputs.canary }}"
+
+      - name: Find + merge the gitops PR
+        id: gitops_pr
+        run: |
+          set -uo pipefail
+          BRANCH="update-helm-version-${{ inputs.environment }}-${{ inputs.version }}"
+          # Wait for the PR to be opened by the dispatched workflow.
+          deadline=$(( $(date +%s) + 600 ))
+          PR=""
+          while :; do
+            PR=$(gh pr list -R "$GITOPS_REPO" --head "$BRANCH" --state open --json number --jq '.[0].number' || echo "")
+            [ -n "$PR" ] && [ "$PR" != "null" ] && break
+            [ "$(date +%s)" -ge "$deadline" ] && { echo "::error::gitops PR ($BRANCH) not opened in time"; exit 1; }
+            sleep 10
+          done
+          echo "pr_url=https://github.com/$GITOPS_REPO/pull/$PR" >> "$GITHUB_OUTPUT"
+          # Same all-checks gate as every other pipeline merge: --admin is an
+          # IMMEDIATE merge that bypasses branch protection, so without this a
+          # gitops check still running (or already failed) wouldn't stop it.
+          python3 scripts/release/wait_for_checks.py --repo "$GITOPS_REPO" --head-branch "$BRANCH"
+          gh pr merge "$PR" -R "$GITOPS_REPO" --squash --admin --delete-branch
+          merged=$(gh pr view "$PR" -R "$GITOPS_REPO" --json merged --jq '.merged')
+          [ "$merged" = "true" ] || { echo "::error::gitops PR not merged"; exit 1; }
+
+      # TODO(review): confirm apply_on_merge.yaml succeeded on gitops main for the
+      # merge commit (poll the workflow run for the merge SHA), so "applied" is real.
+
+      - name: Notify result
+        if: ${{ always() }}
+        run: |
+          python3 scripts/release/callback.py \
+            --phase "${{ steps.phase.outputs.phase }}" \
+            --status "${{ job.status == 'success' && 'success' || 'failed' }}" \
+            --data '{"pr_url": "${{ steps.gitops_pr.outputs.pr_url }}"}'
