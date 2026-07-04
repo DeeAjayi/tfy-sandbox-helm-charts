@@ -69,7 +69,7 @@ def test_latest_service_line_tag_caps_at_base_patch(monkeypatch):
     assert compute_release.latest_service_line_tag("a/svc1", older) is None
 
 
-def _stub_hotfix_env(monkeypatch, current_tags, service_tags=None):
+def _stub_hotfix_env(monkeypatch, current_tags, service_tags=None, main_version="0.1.4"):
     monkeypatch.setattr(
         compute_release,
         "latest_shipped_version",
@@ -78,6 +78,14 @@ def _stub_hotfix_env(monkeypatch, current_tags, service_tags=None):
     monkeypatch.setattr(compute_release, "all_repos", lambda: list(current_tags))
     monkeypatch.setattr(compute_release, "git_branch_exists", lambda *_: True)
     monkeypatch.setattr(compute_release, "next_rc_number", lambda *_: 1)
+    # main's own Chart.yaml version — read by the latest-line hotfix source
+    # check (main must reflect the base before it can be the branch source).
+    # Defaults to the latest shipped final, i.e. a healthy, promoted main.
+    monkeypatch.setattr(
+        compute_release,
+        "read_yaml_at_ref",
+        lambda ref, path: {"version": main_version},
+    )
     monkeypatch.setattr(
         compute_release, "find_component", lambda repo: {"repository": repo},
     )
@@ -300,6 +308,20 @@ def test_hotfix_on_older_line_is_not_on_latest_line(monkeypatch):
     assert final_spec["on_latest_line"] is False
     assert final_spec["fast_forward_main"] is False
     assert final_spec["chart_branch_source_ref"] == "refs/tags/truefoundry-0.1.2"
+
+
+def test_hotfix_latest_line_falls_back_to_tag_when_main_lags(monkeypatch):
+    # latest_shipped comes from git tags; main can lag the tag when a promote
+    # failed or is still pending. A latest-line hotfix must then NOT cut its
+    # chart branch from the stale main (pre-base templates/values) — it falls
+    # back to the shipped truefoundry-<base> tag instead.
+    _stub_hotfix_env(monkeypatch, {"a/svc1": "v0.1.0"}, main_version="0.1.3")
+    monkeypatch.setattr(compute_release, "git_branch_exists", lambda *_: False)
+
+    spec = compute_release.compute_release("hotfix", ["a/svc1"], "")
+
+    assert spec["on_latest_line"] is True
+    assert spec["chart_branch_source_ref"] == "refs/tags/truefoundry-0.1.4"
 
 
 def test_hotfix_chart_only_requires_empty_repositories(monkeypatch):
