@@ -72,36 +72,65 @@ jobs:
           done
 
       - name: Dispatch gitops update workflow
+        id: dispatch
         run: |
           set -euo pipefail
+          # Timestamp BEFORE dispatch: used to find the run this dispatch created.
+          echo "since=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
           gh workflow run update-tfy-llm-gateway-helm-version.yaml -R "$GITOPS_REPO" \
             -f helm_chart_version="${{ inputs.version }}" \
             -f environment="${{ inputs.environment }}" \
             -f canary="${{ inputs.canary }}"
+
+      # The canary and full-fleet stages share ONE branch name
+      # (update-helm-version-<env>-<version>): the canary PR merges (branch
+      # deleted), then the full-fleet dispatch opens a NEW PR on the same
+      # branch with the REMAINING clusters' diff. So a merged PR for the
+      # branch proves nothing about THIS stage — the only sound "nothing to
+      # do" signal is: OUR dispatched update run completed successfully AND
+      # opened no PR (no diff; fleet already at this version).
+      - name: Wait for the dispatched update run
+        run: |
+          set -euo pipefail
+          WF=update-tfy-llm-gateway-helm-version.yaml
+          deadline=$(( $(date +%s) + 600 ))
+          RUN=""
+          while [ -z "$RUN" ]; do
+            RUN=$(gh run list -R "$GITOPS_REPO" --workflow "$WF" \
+              --created ">=${{ steps.dispatch.outputs.since }}" \
+              --json databaseId --jq '.[0].databaseId // empty' || echo "")
+            [ -n "$RUN" ] && break
+            [ "$(date +%s)" -ge "$deadline" ] && { echo "::error::dispatched gitops update run never appeared"; exit 1; }
+            sleep 5
+          done
+          echo "Watching gitops update run $RUN"
+          while :; do
+            read -r STATUS CONCLUSION < <(gh run view "$RUN" -R "$GITOPS_REPO" \
+              --json status,conclusion --jq '[.status, .conclusion // ""] | join(" ")')
+            [ "$STATUS" = "completed" ] && break
+            [ "$(date +%s)" -ge "$deadline" ] && { echo "::error::gitops update run $RUN timed out"; exit 1; }
+            sleep 10
+          done
+          [ "$CONCLUSION" = "success" ] || { echo "::error::gitops update run $RUN concluded $CONCLUSION"; exit 1; }
 
       - name: Find + merge the gitops PR
         id: gitops_pr
         run: |
           set -uo pipefail
           BRANCH="update-helm-version-${{ inputs.environment }}-${{ inputs.version }}"
-          # Wait for the PR to be opened by the dispatched workflow.
-          # Idempotency: if the update workflow produced NO diff (the gitops
-          # file already carries this version — e.g. a stage re-run after a
-          # partial failure), no PR ever opens. A previously MERGED PR for the
-          # same branch is proof the rollout already applied; succeed instead
-          # of polling to a timeout.
-          deadline=$(( $(date +%s) + 600 ))
+          # The update run finished; give the PR a short grace to materialise.
+          deadline=$(( $(date +%s) + 120 ))
           PR=""
           while :; do
             PR=$(gh pr list -R "$GITOPS_REPO" --head "$BRANCH" --state open --json number --jq '.[0].number' || echo "")
             [ -n "$PR" ] && [ "$PR" != "null" ] && break
-            MERGED=$(gh pr list -R "$GITOPS_REPO" --head "$BRANCH" --state merged --json number --jq '.[0].number' || echo "")
-            if [ -n "$MERGED" ] && [ "$MERGED" != "null" ]; then
-              echo "gitops PR #$MERGED ($BRANCH) already merged; treating as applied."
-              echo "pr_url=https://github.com/$GITOPS_REPO/pull/$MERGED" >> "$GITHUB_OUTPUT"
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              # Update run succeeded with no PR -> no diff: every targeted
+              # cluster file already carries this version (stage re-run after
+              # a partial failure). Nothing to merge; the rollout is applied.
+              echo "gitops update run produced no PR ($BRANCH): no diff — already applied."
               exit 0
             fi
-            [ "$(date +%s)" -ge "$deadline" ] && { echo "::error::gitops PR ($BRANCH) not opened in time"; exit 1; }
             sleep 10
           done
           echo "pr_url=https://github.com/$GITOPS_REPO/pull/$PR" >> "$GITHUB_OUTPUT"
