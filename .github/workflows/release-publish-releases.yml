@@ -100,9 +100,12 @@ jobs:
     # off) this is deferred; per-service releases above still run.
     # per_service is legitimately 'skipped' (not failed) for a chart-only
     # hotfix (empty repos) — the chart must still get tagged/released in
-    # that case, so explicitly allow skipped through here.
+    # that case, so explicitly allow skipped through here. The !cancelled()
+    # is load-bearing: without a status-check function in the condition,
+    # GitHub auto-skips this job whenever a needed job was skipped, without
+    # ever evaluating the rest of the expression.
     if: >-
-      ${{ inputs.merge_pr &&
+      ${{ !cancelled() && inputs.merge_pr &&
           (needs.per_service.result == 'success' || needs.per_service.result == 'skipped') }}
     runs-on: ubuntu-latest
     steps:

@@ -105,6 +105,19 @@ jobs:
               exit 1
             fi
           fi
+          # ALWAYS sync .github/workflows from main (independent of sync_main,
+          # which merges everything and is latest-line only). Old-line release
+          # branches were cut from an old chart tag and carry the workflow
+          # files as of that tag — so the branch-resident triggers this release
+          # relies on (oci-release.yml on the branch push, chart-test on the
+          # PR, release-public-truefoundry.yaml at the tagged commit) would
+          # otherwise run the pipeline as it existed when that old line
+          # shipped, missing every fix since. No-op when already current.
+          git fetch origin main
+          git checkout origin/main -- .github/workflows/
+          if ! git diff --cached --quiet; then
+            git commit -m "[release] sync workflows from main"
+          fi
           echo "head_branch=$HEAD_BRANCH" >> "$GITHUB_OUTPUT"
 
       - name: Compute values/chart changes
