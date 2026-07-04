@@ -1,5 +1,5 @@
 global:
-  controlPlaneChartVersion: "0.2.1"
+  controlPlaneChartVersion: "0.2.2"
 
 tfy-llm-gateway:
   enabled: false
