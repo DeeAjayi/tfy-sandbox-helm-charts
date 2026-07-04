@@ -135,8 +135,8 @@ jobs:
           # Same all-checks gate as every other pipeline merge.
           python3 scripts/release/wait_for_checks.py --repo "$UB_REPO" --head-branch develop
           gh pr merge "$PR" -R "$UB_REPO" --merge --admin
-          merged=$(gh pr view "$PR" -R "$UB_REPO" --json merged --jq '.merged')
-          [ "$merged" = "true" ] || { echo "::error::develop->main not merged"; exit 1; }
+          state=$(gh pr view "$PR" -R "$UB_REPO" --json state --jq '.state')
+          [ "$state" = "MERGED" ] || { echo "::error::develop->main not merged"; exit 1; }
 
       - name: Back-merge main -> develop
         id: backmerge
