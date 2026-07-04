@@ -452,13 +452,34 @@ def compute_release(
         # branch's own tip, not the squash commit — see
         # release-helm-update.yml's promote step).
         #
+        # main is only a valid source when it actually REFLECTS the base:
+        # latest_shipped comes from git tags, and main can lag the tag when
+        # a promote failed/is pending (or drifted). Cutting from a lagging
+        # main would give the hotfix a pre-<base> chart baseline (stale
+        # templates/values), so verify main's own Chart.yaml is at the base
+        # version and fall back to the shipped truefoundry-<base> tag when
+        # it isn't — correct content at the cost of a noisier promote PR.
+        #
         # An OLDER-LINE hotfix never promotes to main, so its chart branch is
         # still cut from the previously-shipped chart tag, isolating the fix
         # from anything newer that has landed on main.
-        chart_branch_source_ref = (
-            "refs/heads/main" if on_latest_line
-            else f"refs/tags/{CHART_TAG_PREFIX}{base}"
-        )
+        chart_branch_source_ref = f"refs/tags/{CHART_TAG_PREFIX}{base}"
+        if on_latest_line:
+            try:
+                main_chart = read_yaml_at_ref("origin/main", CHART_PATH)
+                main_version = parse_semver(str(main_chart.get("version", "")))
+            except (ValueError, RuntimeError):
+                main_version = None
+            if main_version == base:
+                chart_branch_source_ref = "refs/heads/main"
+            else:
+                print(
+                    f"warning: main is at {main_version or 'unreadable'} but the "
+                    f"hotfix base is {base}; cutting the chart branch from "
+                    f"refs/tags/{CHART_TAG_PREFIX}{base} instead of main so the "
+                    "branch baseline matches what actually shipped.",
+                    file=sys.stderr,
+                )
         # Coarse fallback / RC parity. Service repos are versioned independently
         # of the chart, so each one's release branch is cut from its OWN current
         # shipped tag (computed per-repo into branch_source_refs below).

@@ -91,7 +91,16 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.TF_GITHUB_CI_ADMIN_TOKEN }}
         run: |
-          if gh api "repos/${INFRA_REPO}/git/ref/heads/${INFRA_BRANCH}" >/dev/null 2>&1; then
+          # Exact-ref existence check. The branch name contains '/', which
+          # must be %-encoded so the refs API sees a single ref segment
+          # (heads/release%2Ftruefoundry-X.Y.Z) — same convention as
+          # scripts/release/ensure_service_branches.py. Belt-and-braces, the
+          # RESOLVED ref name is also compared rather than trusting the exit
+          # code alone — a transient API error would otherwise be misread as
+          # "branch missing"/"branch exists".
+          ENCODED_BRANCH="${INFRA_BRANCH//\//%2F}"
+          FOUND_REF=$(gh api "repos/${INFRA_REPO}/git/ref/heads/${ENCODED_BRANCH}" --jq '.ref' 2>/dev/null || true)
+          if [ "$FOUND_REF" = "refs/heads/${INFRA_BRANCH}" ]; then
             echo "${INFRA_BRANCH} already exists in ${INFRA_REPO}"
             exit 0
           fi
@@ -190,8 +199,11 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.TF_GITHUB_CI_ADMIN_TOKEN }}
         run: |
+          # %-encode the '/' in the branch name so the refs API resolves it
+          # as a single ref segment (see the ensure-branch step above).
+          ENCODED_BRANCH="${INFRA_BRANCH//\//%2F}"
           gh api "repos/${INFRA_REPO}/git/ref/heads/main" --jq .object.sha > /tmp/main_sha
-          gh api "repos/${INFRA_REPO}/git/ref/heads/${INFRA_BRANCH}" --jq .object.sha > /tmp/branch_sha
+          gh api "repos/${INFRA_REPO}/git/ref/heads/${ENCODED_BRANCH}" --jq .object.sha > /tmp/branch_sha
           if [ "$(cat /tmp/main_sha)" = "$(cat /tmp/branch_sha)" ]; then
             echo "main is already up to date with ${INFRA_BRANCH}; nothing to promote."
             exit 0
@@ -244,23 +256,27 @@ jobs:
           echo "GATEWAY_BRANCH=release/tfy-llm-gateway-${GATEWAY_VERSION}" >> "$GITHUB_ENV"
 
       - name: Ensure tfy-llm-gateway reference branch exists
-        id: ensure_gateway_branch
         env:
           GH_TOKEN: ${{ secrets.TF_GITHUB_CI_ADMIN_TOKEN }}
         run: |
-          if gh api "repos/${INFRA_REPO}/git/ref/heads/${GATEWAY_BRANCH}" >/dev/null 2>&1; then
-            echo "${GATEWAY_BRANCH} already exists in ${INFRA_REPO}; nothing to snapshot (same version already recorded)."
-            echo "skip=true" >> "$GITHUB_OUTPUT"
+          # Exact-ref existence check with %-encoded '/' — same rationale as
+          # the release-branch ensure step above. NOTE: an existing branch
+          # does NOT skip the snapshot below — a previous run may have
+          # created the branch and then died before pushing the snapshot
+          # commit, so the snapshot always runs and relies on its own
+          # "commit only if the tree actually changed" check for idempotency.
+          ENCODED_BRANCH="${GATEWAY_BRANCH//\//%2F}"
+          FOUND_REF=$(gh api "repos/${INFRA_REPO}/git/ref/heads/${ENCODED_BRANCH}" --jq '.ref' 2>/dev/null || true)
+          if [ "$FOUND_REF" = "refs/heads/${GATEWAY_BRANCH}" ]; then
+            echo "${GATEWAY_BRANCH} already exists in ${INFRA_REPO}"
           else
             MAIN_SHA=$(gh api "repos/${INFRA_REPO}/git/ref/heads/main" --jq .object.sha)
             gh api "repos/${INFRA_REPO}/git/refs" --method POST \
               -f "ref=refs/heads/${GATEWAY_BRANCH}" -f "sha=${MAIN_SHA}"
             echo "Created ${GATEWAY_BRANCH} in ${INFRA_REPO} from main"
-            echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Checkout tfy-llm-gateway reference branch
-        if: ${{ steps.ensure_gateway_branch.outputs.skip == 'false' }}
         uses: actions/checkout@v4
         with:
           repository: ${{ vars.INFRA_CHARTS_REPO || 'truefoundry/infra-charts' }}
@@ -269,7 +285,6 @@ jobs:
           path: tmp_gateway_ref
 
       - name: Snapshot tfy-llm-gateway into its reference branch
-        if: ${{ steps.ensure_gateway_branch.outputs.skip == 'false' }}
         working-directory: tmp_gateway_ref
         run: |
           rm -rf charts/tfy-llm-gateway
@@ -278,7 +293,7 @@ jobs:
           git config user.email "ci@truefoundry.com"
           git add charts/tfy-llm-gateway
           if git diff --cached --quiet; then
-            echo "No changes to charts/tfy-llm-gateway on a freshly-cut branch; nothing to commit."
+            echo "Branch already carries this exact tfy-llm-gateway tree; nothing to commit."
           else
             git commit -m "[CI] tfy-llm-gateway ${GATEWAY_VERSION} (reference snapshot, not released from this branch)"
             git push origin "HEAD:refs/heads/${GATEWAY_BRANCH}"
