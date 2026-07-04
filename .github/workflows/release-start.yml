@@ -56,6 +56,11 @@ on:
         type: string
         required: false
         default: ""
+      allow_tag_move:
+        description: "Override the 'fail loud if a git tag exists at a different SHA' guard in publish (deliberate re-tag on a re-run)."
+        type: boolean
+        required: false
+        default: false
 
 run-name: "release-${{ inputs.kind }}-${{ github.run_number }}"
 
@@ -298,6 +303,7 @@ jobs:
       tag_map: ${{ needs.resolve_outputs.outputs.tag_map }}
       commit_map: ${{ needs.resolve_outputs.outputs.commit_map }}
       merge_pr: ${{ inputs.merge_pr && needs.helm.result == 'success' }}
+      allow_tag_move: ${{ inputs.allow_tag_move }}
     secrets: inherit
 
   # Deploy to the DEVELOP cluster: bump truefoundry's targetRevision in
@@ -344,6 +350,26 @@ jobs:
           python3 scripts/release/deploy.py \
             --target develop \
             --version '${{ inputs.deploy_only && inputs.deploy_version || fromJSON(needs.compute_release.outputs.spec).tag }}'
+      # deploy.py opens + auto-merges the ubermold-base develop PR (and fails if
+      # it couldn't), or no-ops when already at the version (no PR). Confirm: if a
+      # PR for this branch exists it MUST be merged; absence is fine (no-op path).
+      - name: Confirm develop PR merged
+        if: ${{ steps.deploy.outcome == 'success' }}
+        env:
+          GH_TOKEN: ${{ secrets.TF_GITHUB_CI_ADMIN_TOKEN }}
+        run: |
+          set -uo pipefail
+          VER='${{ inputs.deploy_only && inputs.deploy_version || fromJSON(needs.compute_release.outputs.spec).tag }}'
+          VER="${VER#v}"
+          BR="deploy-develop-truefoundry-${VER}"
+          # Same sandbox/fork overrides deploy.py itself uses.
+          UBERMOLD="${{ vars.UBERMOLD_ORG || 'truefoundry' }}/${{ vars.UBERMOLD_BASE_REPO || 'ubermold-base' }}"
+          merged=$(gh pr list -R "$UBERMOLD" --head "$BR" \
+            --state all --json merged --jq '.[0].merged // empty' || echo "")
+          echo "develop PR ($BR) merged=${merged:-<no PR>}"
+          if [ -n "$merged" ] && [ "$merged" != "true" ]; then
+            echo "::error::develop PR $BR exists but is not merged"; exit 1
+          fi
       - name: Notify release-app — deploy_develop
         if: ${{ always() && inputs.deploy_only != true }}
         run: |
@@ -369,16 +395,80 @@ jobs:
   # would still open a PR bumping ubermold-truefoundry's live prod
   # targetRevision to the older version — a downgrade from whatever's
   # currently deployed.
+  #
+  # Availability gate: the truefoundry chart that prod will deploy must actually
+  # be pullable from OCI before we open the prod PR. Runs only on the cp-prod
+  # path (prod / latest-line hotfix final, per fast_forward_main — same rule as
+  # deploy_prod below) in normal (non deploy-only) mode.
+  # See design-docs/release/release-end-to-end.md §4 (stage 1v) + §6.
+  verify_truefoundry_oci:
+    needs:
+      - compute_release
+      - publish_releases
+    if: >-
+      ${{ !cancelled() && inputs.deploy_only != true
+          && needs.publish_releases.result == 'success'
+          && (inputs.kind == 'prod' || inputs.kind == 'hotfix')
+          && fromJSON(needs.compute_release.outputs.spec || '{}').fast_forward_main == true }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+      - name: Notify release-app — verify_truefoundry_oci running
+        run: |
+          python3 scripts/release/callback.py \
+            --phase verify_truefoundry_oci --status running \
+            --spec '${{ needs.compute_release.outputs.spec }}'
+      - name: Poll OCI until truefoundry chart is pullable
+        # Prod's chart registry is PUBLIC (anonymous pulls), so no
+        # `helm registry login` is needed there; sandbox/fork registries may
+        # not be, hence the optional login. Registry/repo come from the same
+        # repo variables oci-release.yml publishes with, so this gate always
+        # polls the registry the pipeline actually pushed to. The OCI chart
+        # version equals spec.chart_version (the same value publish builds
+        # the truefoundry-<v> tag from), with no leading 'v'.
+        env:
+          OCI_REGISTRY: ${{ vars.OCI_HELM_REGISTRY || 'tfy.jfrog.io' }}
+          OCI_REF: oci://${{ vars.OCI_HELM_REGISTRY || 'tfy.jfrog.io' }}/${{ vars.OCI_HELM_REPOSITORY || 'tfy-helm' }}/truefoundry
+          REGISTRY_USER: ${{ secrets.TRUEFOUNDRY_ARTIFACTORY_PUBLIC_USERNAME }}
+          REGISTRY_PASS: ${{ secrets.TRUEFOUNDRY_ARTIFACTORY_PUBLIC_PASSWORD }}
+        run: |
+          set -uo pipefail
+          # Log in to the SAME registry the pull below targets — a login host
+          # taken from a different variable can authenticate the wrong
+          # registry in sandbox/fork setups and make this gate time out on a
+          # chart that IS published.
+          if [ -n "$REGISTRY_USER" ]; then
+            helm registry login "$OCI_REGISTRY" -u "$REGISTRY_USER" -p "$REGISTRY_PASS"
+          fi
+          VER='${{ fromJSON(needs.compute_release.outputs.spec).chart_version }}'
+          deadline=$(( $(date +%s) + 1200 ))
+          until helm pull "$OCI_REF" --version "$VER" >/dev/null 2>&1; do
+            [ "$(date +%s)" -ge "$deadline" ] && { echo "::error::truefoundry $VER not in OCI ($OCI_REF)"; exit 1; }
+            sleep 15
+          done
+      - name: Notify release-app — verify_truefoundry_oci
+        if: ${{ always() }}
+        run: |
+          python3 scripts/release/callback.py \
+            --phase verify_truefoundry_oci \
+            --status "${{ job.status == 'success' && 'success' || 'failed' }}" \
+            --spec '${{ needs.compute_release.outputs.spec }}'
+
   deploy_prod:
     needs:
       - compute_release
       - publish_releases
+      - verify_truefoundry_oci
+    # cp-prod path also requires the OCI availability gate (verify_truefoundry_oci)
+    # to have succeeded. In deploy-only mode that gate is skipped and not required.
     if: >-
       ${{ !cancelled()
           && (
             (inputs.deploy_only
               && (inputs.kind == 'prod' || inputs.kind == 'hotfix'))
             || (needs.publish_releases.result == 'success'
+              && needs.verify_truefoundry_oci.result == 'success'
               && (inputs.kind == 'prod' || inputs.kind == 'hotfix')
               && fromJSON(needs.compute_release.outputs.spec || '{}').fast_forward_main == true)
           ) }}

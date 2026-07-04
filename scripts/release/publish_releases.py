@@ -60,23 +60,46 @@ def tag_ref_sha(repo: str, tag: str) -> str | None:
     return obj["sha"]
 
 
-def ensure_tag(repo: str, tag: str, sha: str) -> None:
-    """Create `tag` at `sha` if absent; no-op if already at the same sha; warn
-    and reuse the existing tag if it points at a different sha.
+def ensure_tag(repo: str, tag: str, sha: str, allow_move: bool = False) -> None:
+    """Create `tag` at `sha` if absent; no-op if already at the same sha.
 
-    B6: we deliberately do NOT raise on a sha mismatch. Re-runs after a partial
-    failure may compute a slightly-different commit (e.g. branch advanced), but
-    the tag already in the registry is the source of truth for what shipped.
-    Moving the tag would un-pin already-published artifacts, so warn and leave
-    it alone; the caller will use the existing tag's sha for ensure_release."""
+    B6: by default we deliberately do NOT move an existing tag on a sha mismatch.
+    Re-runs after a partial failure may compute a slightly-different commit (e.g.
+    branch advanced), but the tag already in the registry is the source of truth
+    for what shipped — moving it would un-pin already-published artifacts, so we
+    warn and reuse the existing tag.
+
+    `allow_move` (operator override, via release-start.yml `allow_tag_move`)
+    forces a deliberate re-tag: the existing ref is updated to point at `sha`.
+    Use only on a re-run where moving the tag is intended."""
     current = tag_ref_sha(repo, tag)
     if current == sha:
         return
-    if current:
+    if current and not allow_move:
         print(
             f"::warning::tag {tag} on {repo} already exists at {current} "
             f"(expected {sha}); reusing existing tag.",
             file=sys.stderr,
+        )
+        return
+    if current and allow_move:
+        print(
+            f"::warning::allow_tag_move set — moving tag {tag} on {repo} "
+            f"from {current} to {sha}.",
+            file=sys.stderr,
+        )
+        run(
+            [
+                "gh",
+                "api",
+                f"repos/{repo}/git/refs/tags/{tag}",
+                "--method",
+                "PATCH",
+                "-f",
+                f"sha={sha}",
+                "-F",
+                "force=true",
+            ],
         )
         return
     run(
@@ -341,7 +364,7 @@ def subcommand_per_service(args: argparse.Namespace) -> int:
     prerelease = is_prerelease_version(tag)
     previous_tag = resolve_previous_tag(spec, repo, tag)
     notes = generate_notes(repo, tag, sha, previous_tag=previous_tag)
-    ensure_tag(repo, tag, sha)
+    ensure_tag(repo, tag, sha, allow_move=getattr(args, "allow_tag_move", False))
     # Only a latest-line final may take the repo's "Latest" badge; an
     # older-line hotfix final must not steal it from the newest version.
     ensure_release(
@@ -374,7 +397,7 @@ def subcommand_helm_charts(args: argparse.Namespace) -> int:
     tag = f"truefoundry-{spec['chart_version']}"
     branch = spec["branch"]
     sha = resolve_branch_sha(repo, branch)
-    ensure_tag(repo, tag, sha)
+    ensure_tag(repo, tag, sha, allow_move=getattr(args, "allow_tag_move", False))
 
     lines = [f"Truefoundry chart {tag}", "", "## Component tags"]
     for component_repo in sorted(tag_map):
@@ -403,6 +426,11 @@ def main() -> int:
     per_service.add_argument("--tag-map", required=True)
     per_service.add_argument("--commit-map", required=True)
     per_service.add_argument("--repo", required=True)
+    per_service.add_argument(
+        "--allow-tag-move",
+        action="store_true",
+        help="Deliberately move an existing tag to the new sha (operator override).",
+    )
     per_service.set_defaults(handler=subcommand_per_service)
 
     helm = subparsers.add_parser("helm-charts")
@@ -414,6 +442,11 @@ def main() -> int:
     helm.add_argument(
         "--repository",
         default=os.environ.get("GITHUB_REPOSITORY", "truefoundry/helm-charts"),
+    )
+    helm.add_argument(
+        "--allow-tag-move",
+        action="store_true",
+        help="Deliberately move an existing tag to the new sha (operator override).",
     )
     helm.set_defaults(handler=subcommand_helm_charts)
 

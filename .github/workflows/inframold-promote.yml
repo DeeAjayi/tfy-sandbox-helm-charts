@@ -1,0 +1,201 @@
+name: Inframold promote (ubermold-base)
+
+# Bumps the inframold chartVersion on ubermold-base develop, promotes develop->main
+# (MERGE COMMIT — never squash, to preserve history for the HEAD^ version check),
+# then back-merges main->develop. The promotion triggers
+# publish-inframold-charts.yaml on ubermold-base main, which OPENS the infra-charts
+# inframold PR (#2928) — that PR is HELD and merged later by merge-inframold.yml.
+# See design-docs §4 stage 6 + §1 decisions.
+#
+# STUB — needs review before enabling. Cross-repo writes to ubermold-base.
+
+on:
+  workflow_call:
+    inputs:
+      truefoundry_version:
+        description: "optional: also set targetRevision in the truefoundry.yaml template"
+        required: false
+        type: string
+        default: ""
+    outputs:
+      inframold_version:
+        description: "The inframold chartVersion (IV) this promotion bumped to."
+        value: ${{ jobs.promote.outputs.inframold_version }}
+  workflow_dispatch:
+    inputs:
+      truefoundry_version:
+        required: false
+        type: string
+        default: ""
+
+env:
+  RELEASE_APP_BASE_URL: ${{ vars.RELEASE_APP_BASE_URL }}
+  RELEASE_APP_CALLBACK_TOKEN: ${{ secrets.RELEASE_APP_CALLBACK_TOKEN }}
+  # Sandbox/fork overrides; same variables deploy.py uses.
+  UB_REPO: ${{ vars.UBERMOLD_ORG || 'truefoundry' }}/${{ vars.UBERMOLD_BASE_REPO || 'ubermold-base' }}
+  CC_FILES: >-
+    k8s/cookiecutter-aws-eks.json
+    k8s/cookiecutter-azure-aks.json
+    k8s/cookiecutter-civo-talos.json
+    k8s/cookiecutter-gcp-gke-standard.json
+    k8s/cookiecutter-generic.json
+    k8s/cookiecutter.json
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.TF_GITHUB_CI_ADMIN_TOKEN }}
+    outputs:
+      inframold_version: ${{ steps.ver.outputs.next }}
+    steps:
+      - name: Checkout helm-charts (for callback.py)
+        uses: actions/checkout@v4
+
+      - name: Notify running
+        run: python3 scripts/release/callback.py --phase infra_inframold --status running
+
+      - name: Checkout ubermold-base (develop)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UB_REPO }}
+          ref: develop
+          token: ${{ secrets.TF_GITHUB_CI_ADMIN_TOKEN }}
+          fetch-depth: 0
+          path: ub
+
+      - name: Compute next chartVersion
+        id: ver
+        working-directory: ub
+        run: |
+          set -euo pipefail
+          cur=$(jq -r '.chartVersion' k8s/cookiecutter.json)
+          major=$(echo "$cur" | cut -d. -f1); minor=$(echo "$cur" | cut -d. -f2); patch=$(echo "$cur" | cut -d. -f3)
+          next="${major}.${minor}.$((patch+1))"
+          echo "cur=$cur" >> "$GITHUB_OUTPUT"
+          echo "next=$next" >> "$GITHUB_OUTPUT"
+          echo "Bumping chartVersion $cur -> $next"
+
+      - name: Bump chartVersion + open & merge develop PR
+        working-directory: ub
+        run: |
+          set -euo pipefail
+          NEXT='${{ steps.ver.outputs.next }}'
+          TS=$(date +%Y%m%d-%H%M%S)
+          BR="bump-chartVersion-${NEXT//./-}-${TS}"
+          git config user.name "truefoundry-saas"
+          git config user.email "saas@truefoundry.com"
+          git checkout -b "$BR"
+          for f in $CC_FILES; do
+            tmp=$(mktemp); jq --arg v "$NEXT" '.chartVersion=$v' "$f" > "$tmp" && mv "$tmp" "$f"
+          done
+          # Optionally bump the truefoundry targetRevision in the cookiecutter
+          # template so the generated inframold charts pin the released CP
+          # version. The template's filename is a cookiecutter conditional
+          # (literal on disk), so locate it BY CONTENT — same approach as
+          # deploy.py's find_develop_template — rather than hardcoding the
+          # exact jinja filename, which silently breaks if it ever drifts.
+          TFY_VER='${{ inputs.truefoundry_version }}'
+          if [ -n "$TFY_VER" ]; then
+            TF_TPL=$(grep -rl 'chart: truefoundry' k8s --include='*truefoundry.yaml*' | head -1 || true)
+            if [ -n "$TF_TPL" ] && [ -f "$TF_TPL" ]; then
+              sed -i -E "s|targetRevision:[[:space:]]*[^[:space:]]+|targetRevision: ${TFY_VER}|" "$TF_TPL"
+              echo "Set targetRevision -> ${TFY_VER} in ${TF_TPL}"
+            else
+              echo "::error::truefoundry.yaml template not found under k8s/ — cannot pin targetRevision ${TFY_VER}"
+              exit 1
+            fi
+          fi
+          git commit -am "Bump chartVersion to ${NEXT} across cookiecutter templates"
+          git push origin "$BR"
+          # `gh pr create` prints the PR URL (it has no --json flag) — take the
+          # number from it, falling back to a lookup if the PR already exists.
+          PR_URL=$(gh pr create -R "$UB_REPO" --base develop --head "$BR" \
+            --title "Bump chartVersion to ${NEXT} across cookiecutter templates" \
+            --body "Bumps chartVersion from ${{ steps.ver.outputs.cur }} to ${NEXT}." 2>/dev/null) \
+            || PR_URL=$(gh pr list -R "$UB_REPO" --head "$BR" --state open --json url --jq '.[0].url // empty')
+          PR="${PR_URL##*/}"
+          [ -n "$PR" ] || { echo "::error::could not create or find the chartVersion bump PR ($BR)"; exit 1; }
+          # Gate the --admin merge on ALL checks passing (an admin merge
+          # bypasses branch protection, so a failing/in-progress ubermold-base
+          # check wouldn't otherwise stop it). Script lives in the helm-charts
+          # checkout at the workspace root (this step runs in ub/).
+          python3 ../scripts/release/wait_for_checks.py --repo "$UB_REPO" --head-branch "$BR"
+          gh pr merge "$PR" -R "$UB_REPO" --squash --admin --delete-branch
+
+      - name: Promote develop -> main (MERGE COMMIT, no squash)
+        run: |
+          set -euo pipefail
+          PR_URL=$(gh pr create -R "$UB_REPO" --base main --head develop \
+            --title "Release: Bump chartVersion to ${{ steps.ver.outputs.next }}" \
+            --body "Promotes the chartVersion ${{ steps.ver.outputs.next }} bump from develop to main. Do NOT squash." 2>/dev/null) \
+            || PR_URL=$(gh pr list -R "$UB_REPO" --base main --head develop --state open --json url --jq '.[0].url // empty')
+          PR="${PR_URL##*/}"
+          [ -n "$PR" ] || { echo "::error::could not create or find the develop->main promote PR"; exit 1; }
+          # Same all-checks gate as every other pipeline merge.
+          python3 scripts/release/wait_for_checks.py --repo "$UB_REPO" --head-branch develop
+          gh pr merge "$PR" -R "$UB_REPO" --merge --admin
+          merged=$(gh pr view "$PR" -R "$UB_REPO" --json merged --jq '.merged')
+          [ "$merged" = "true" ] || { echo "::error::develop->main not merged"; exit 1; }
+
+      - name: Back-merge main -> develop
+        id: backmerge
+        run: |
+          set -euo pipefail
+          # "Nothing to back-merge" is the ONLY acceptable soft outcome (gh pr
+          # create fails with "No commits between develop and main"). Any other
+          # failure — conflict, permissions, merge rejected — must FAIL the
+          # step: silently skipping the sync leaves develop behind main and the
+          # ubermold_backmerge callback lying about it.
+          ERR=$(mktemp)
+          if PR_URL=$(gh pr create -R "$UB_REPO" --base develop --head main \
+            --title "Back-merge: Sync main to develop after chartVersion ${{ steps.ver.outputs.next }}" \
+            --body "Syncs main back to develop after the release." 2>"$ERR"); then
+            :
+          elif grep -qi "no commits between" "$ERR"; then
+            echo "main and develop already in sync; nothing to back-merge."
+            exit 0
+          else
+            # The PR may already exist from a previous run — reuse it.
+            PR_URL=$(gh pr list -R "$UB_REPO" --base develop --head main --state open --json url --jq '.[0].url // empty')
+            if [ -z "$PR_URL" ]; then
+              cat "$ERR"
+              echo "::error::back-merge PR creation failed"; exit 1
+            fi
+          fi
+          PR="${PR_URL##*/}"
+          # Same all-checks gate as the two merges above.
+          python3 scripts/release/wait_for_checks.py --repo "$UB_REPO" --head-branch main
+          gh pr merge "$PR" -R "$UB_REPO" --merge --admin --delete-branch
+          merged=$(gh pr view "$PR" -R "$UB_REPO" --json merged --jq '.merged')
+          [ "$merged" = "true" ] || { echo "::error::back-merge PR #$PR not merged"; exit 1; }
+
+      - name: Notify infra_inframold (opened/held) + back-merge
+        if: ${{ always() }}
+        run: |
+          # The success note must only accompany a SUCCESS — pairing a failed
+          # phase with "develop->main merged; PR opened" text misleads
+          # release-app operators about what actually happened.
+          if [ "${{ job.status }}" = "success" ]; then
+            DATA='{"note": "develop->main merged; infra-charts #2928 opened and HELD for merge-inframold"}'
+          else
+            DATA='{"note": "inframold promote FAILED — check the run logs; develop->main may not have merged"}'
+          fi
+          python3 scripts/release/callback.py \
+            --phase infra_inframold \
+            --status "${{ job.status == 'success' && 'success' || 'failed' }}" \
+            --data "$DATA"
+          # Report the back-merge under its own phase from its own step outcome
+          # (not the whole job's): a back-merge failure must not be masked by
+          # anything else, and vice versa. When an EARLIER step failed the
+          # back-merge never ran (outcome 'skipped') — don't report a failure
+          # that didn't happen; the infra_inframold callback above already
+          # carries the job failure.
+          BACKMERGE_OUTCOME='${{ steps.backmerge.outcome }}'
+          if [ "$BACKMERGE_OUTCOME" = "skipped" ]; then
+            echo "back-merge step never ran (earlier step failed); not reporting ubermold_backmerge"
+          else
+            python3 scripts/release/callback.py \
+              --phase ubermold_backmerge \
+              --status "$([ "$BACKMERGE_OUTCOME" = "success" ] && echo success || echo failed)"
+          fi

@@ -1,0 +1,125 @@
+name: Verify chart available
+
+# Poll a registry until a chart version is actually pullable, or fail on timeout.
+# Gates any stage that consumes a chart (prod apply needs truefoundry in OCI;
+# gateway needs tfy-llm-gateway on gh-pages). See design-docs §6.
+
+on:
+  workflow_call:
+    inputs:
+      source_type:
+        description: "oci | helm-repo"
+        required: true
+        type: string
+      location:
+        description: "OCI host+path (e.g. tfy.jfrog.io/tfy-helm) or helm repo URL (e.g. https://truefoundry.github.io/infra-charts)"
+        required: true
+        type: string
+      chart:
+        required: true
+        type: string
+      version:
+        required: true
+        type: string
+      timeout_seconds:
+        required: false
+        type: number
+        default: 1200
+      poll_seconds:
+        required: false
+        type: number
+        default: 15
+      phase:
+        description: "callback phase id (e.g. verify_truefoundry_oci); optional"
+        required: false
+        type: string
+        default: ""
+  workflow_dispatch:
+    inputs:
+      source_type:
+        required: true
+        type: string
+      location:
+        required: true
+        type: string
+      chart:
+        required: true
+        type: string
+      version:
+        required: true
+        type: string
+      timeout_seconds:
+        required: false
+        type: number
+        default: 1200
+      poll_seconds:
+        required: false
+        type: number
+        default: 15
+      phase:
+        required: false
+        type: string
+        default: ""
+
+env:
+  RELEASE_APP_BASE_URL: ${{ vars.RELEASE_APP_BASE_URL }}
+  RELEASE_APP_CALLBACK_TOKEN: ${{ secrets.RELEASE_APP_CALLBACK_TOKEN }}
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+
+      - name: Notify running
+        if: ${{ inputs.phase != '' }}
+        run: python3 scripts/release/callback.py --phase "${{ inputs.phase }}" --status running
+
+      - name: Poll until chart is available
+        # Prod's OCI registry allows anonymous pulls; sandbox/fork registries
+        # (e.g. private GHCR) may not — log in when creds are configured. The
+        # login host is derived from the LOCATION being polled (its first path
+        # segment), so the credentials always authenticate the registry the
+        # pull actually targets.
+        env:
+          REGISTRY_USER: ${{ secrets.TRUEFOUNDRY_ARTIFACTORY_PUBLIC_USERNAME }}
+          REGISTRY_PASS: ${{ secrets.TRUEFOUNDRY_ARTIFACTORY_PUBLIC_PASSWORD }}
+        run: |
+          set -uo pipefail
+          deadline=$(( $(date +%s) + ${{ inputs.timeout_seconds }} ))
+          SRC='${{ inputs.source_type }}'
+          LOC='${{ inputs.location }}'
+          if [ "$SRC" = "oci" ] && [ -n "$REGISTRY_USER" ]; then
+            helm registry login "${LOC%%/*}" -u "$REGISTRY_USER" -p "$REGISTRY_PASS"
+          fi
+          CHART='${{ inputs.chart }}'
+          VER='${{ inputs.version }}'
+          while :; do
+            if [ "$SRC" = "oci" ]; then
+              if helm pull "oci://${LOC}/${CHART}" --version "$VER" >/dev/null 2>&1; then
+                echo "Available: oci://${LOC}/${CHART} ${VER}"; exit 0
+              fi
+            elif [ "$SRC" = "helm-repo" ]; then
+              # gh-pages index.yaml is CDN-cached and lags — re-add/update each loop.
+              helm repo add _verify "$LOC" >/dev/null 2>&1 || true
+              helm repo update _verify >/dev/null 2>&1 || true
+              if helm search repo "_verify/${CHART}" --version "$VER" 2>/dev/null | grep -q "$VER"; then
+                echo "Available: ${LOC} ${CHART} ${VER}"; exit 0
+              fi
+            else
+              echo "::error::unknown source_type '$SRC'"; exit 2
+            fi
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::error::${CHART} ${VER} not available on ${LOC} after ${{ inputs.timeout_seconds }}s"
+              exit 1
+            fi
+            sleep "${{ inputs.poll_seconds }}"
+          done
+
+      - name: Notify result
+        if: ${{ always() && inputs.phase != '' }}
+        run: |
+          python3 scripts/release/callback.py \
+            --phase "${{ inputs.phase }}" \
+            --status "${{ job.status == 'success' && 'success' || 'failed' }}"

@@ -258,6 +258,7 @@ jobs:
           python3 orchestrator/scripts/release/wait_for_chart.py \
             --tag-map '${{ inputs.tag_map }}' \
             --components-path orchestrator/config/components.yml \
+            --charts-root chart \
             --oci-registry "$OCI_REGISTRY"
 
       # B4: forward the release branch into main via an auto-merged PR (NOT a

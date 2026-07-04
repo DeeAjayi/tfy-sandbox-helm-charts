@@ -67,6 +67,18 @@ VALID_PHASES = (
     "finalize",
     "deploy_develop",
     "deploy_prod",
+    # --- end-to-end tail phases (see release-app design-docs/release/release-end-to-end.md) ---
+    "verify_truefoundry_oci",
+    "infra_truefoundry",
+    "ubermold_develop",
+    "purge_cache",
+    "verify_gateway_ghpages",
+    "gateway_dev",
+    "gateway_prod_canary",
+    "gateway_prod",
+    "infra_inframold",
+    "ubermold_backmerge",
+    "verify_inframold",
 )
 
 VALID_STATUSES = ("success", "failed", "skipped", "running")

@@ -24,7 +24,7 @@ import sys
 import time
 from typing import Any
 
-from _lib import gh_api, run
+from _lib import run
 
 TERMINAL_STATUSES = {"completed"}
 # Every completed check-run conclusion that does NOT represent a pass.
@@ -59,31 +59,53 @@ def resolve_head_sha(repo: str, head_branch: str) -> str:
     return pr["headRefOid"]
 
 
+def _gh_api_all_pages(path: str) -> list[dict[str, Any]]:
+    """GET a paginated endpoint, returning the parsed page objects as a list.
+
+    `--slurp` wraps the pages in a JSON array (plain `--paginate` concatenates
+    JSON documents, which json.loads can't parse for object responses).
+    """
+    result = run(["gh", "api", "--paginate", "--slurp", path], check=False)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"gh api {path} failed: "
+            f"{result.stderr.strip() or result.stdout.strip() or 'unknown error'}",
+        )
+    return json.loads(result.stdout) if result.stdout.strip() else []
+
+
 def fetch_checks(repo: str, sha: str) -> list[dict[str, Any]]:
     checks: list[dict[str, Any]] = []
 
-    check_runs = gh_api(f"repos/{repo}/commits/{sha}/check-runs") or {}
-    for item in check_runs.get("check_runs", []):
-        checks.append(
-            {
-                "name": item.get("name"),
-                "status": item.get("status"),
-                "conclusion": item.get("conclusion"),
-            },
-        )
+    # Paginated: GitHub returns at most 30 check runs per page by default —
+    # a busy commit can exceed one page, and a missing page could hide an
+    # in-progress or failing check, letting the merge ladder proceed early.
+    for page in _gh_api_all_pages(
+        f"repos/{repo}/commits/{sha}/check-runs?per_page=100",
+    ):
+        for item in (page or {}).get("check_runs", []):
+            checks.append(
+                {
+                    "name": item.get("name"),
+                    "status": item.get("status"),
+                    "conclusion": item.get("conclusion"),
+                },
+            )
 
     # Legacy commit-status API — some external CI reports here instead of as
     # a check-run. Combined per-context, latest state only.
-    combined = gh_api(f"repos/{repo}/commits/{sha}/status") or {}
-    for item in combined.get("statuses", []):
-        state = item.get("state")
-        checks.append(
-            {
-                "name": item.get("context"),
-                "status": "in_progress" if state == "pending" else "completed",
-                "conclusion": state,
-            },
-        )
+    for page in _gh_api_all_pages(
+        f"repos/{repo}/commits/{sha}/status?per_page=100",
+    ):
+        for item in (page or {}).get("statuses", []):
+            state = item.get("state")
+            checks.append(
+                {
+                    "name": item.get("context"),
+                    "status": "in_progress" if state == "pending" else "completed",
+                    "conclusion": state,
+                },
+            )
 
     return checks
 
