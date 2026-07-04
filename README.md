@@ -29,3 +29,4 @@ gh workflow run release-start.yml --repo DeeAjayi/tfy-sandbox-helm-charts \
 
 Then promote, hotfix, chart_only, etc. exactly as documented in
 `scripts/release/README.md`.
+e2e Sat Jul  4 17:35:11 WAT 2026
