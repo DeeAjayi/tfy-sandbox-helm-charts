@@ -85,11 +85,22 @@ jobs:
           set -uo pipefail
           BRANCH="update-helm-version-${{ inputs.environment }}-${{ inputs.version }}"
           # Wait for the PR to be opened by the dispatched workflow.
+          # Idempotency: if the update workflow produced NO diff (the gitops
+          # file already carries this version — e.g. a stage re-run after a
+          # partial failure), no PR ever opens. A previously MERGED PR for the
+          # same branch is proof the rollout already applied; succeed instead
+          # of polling to a timeout.
           deadline=$(( $(date +%s) + 600 ))
           PR=""
           while :; do
             PR=$(gh pr list -R "$GITOPS_REPO" --head "$BRANCH" --state open --json number --jq '.[0].number' || echo "")
             [ -n "$PR" ] && [ "$PR" != "null" ] && break
+            MERGED=$(gh pr list -R "$GITOPS_REPO" --head "$BRANCH" --state merged --json number --jq '.[0].number' || echo "")
+            if [ -n "$MERGED" ] && [ "$MERGED" != "null" ]; then
+              echo "gitops PR #$MERGED ($BRANCH) already merged; treating as applied."
+              echo "pr_url=https://github.com/$GITOPS_REPO/pull/$MERGED" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
             [ "$(date +%s)" -ge "$deadline" ] && { echo "::error::gitops PR ($BRANCH) not opened in time"; exit 1; }
             sleep 10
           done
