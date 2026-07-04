@@ -4,25 +4,26 @@
 # below). Mirrors helm-charts' own branching model instead of landing
 # directly on infra-charts main:
 #
-#   1. Ensure truefoundry-<VERSION> exists in infra-charts (cut from its
-#      main). Named after the same truefoundry-X.Y.Z string as the tag that
-#      triggered this run (and the tag infra-charts' own chart-releaser will
-#      create) — not helm-charts' own release-v<VERSION> branch name, to
-#      match the existing per-chart branch convention already used in
-#      infra-charts (e.g. truefoundry-LLMGateway-version-v*,
-#      tfy-OtelCollector-version-v*).
+#   1. Ensure release/truefoundry-<VERSION> exists in infra-charts (cut from
+#      its main). Carries the same truefoundry-X.Y.Z string as the tag that
+#      triggered this run, under a release/ prefix — the prefix is load-
+#      bearing: a branch named EXACTLY truefoundry-<VERSION> collides with
+#      the identically-named git tag chart-releaser mints in that repo, and
+#      git short-ref resolution (actions/checkout, create-pull-request)
+#      breaks on the ambiguity for every run after the tag exists.
 #   2. Copy the charts in via a PR into THAT branch, then auto-merge.
 #   3. gh-pages publish happens off that push (infra-charts' release.yaml /
-#      artifactory-helm-release.yaml both trigger on truefoundry-* pushes).
+#      artifactory-helm-release.yaml both trigger on release/truefoundry-*
+#      pushes).
 #   4. Only if this version is the current latest shipped line, ALSO
 #      fast-forward infra-charts main via a squash PR — same
 #      "latest-line-only" rule helm-charts applies to its own main.
 #   5. Separately, also snapshot tfy-llm-gateway (versioned independently of
-#      truefoundry) into its OWN tfy-llm-gateway-<its version> branch — pure
-#      reference so its incremental history is browsable even when its
-#      version diverges from the bundled truefoundry-<VERSION> branch above.
-#      Not part of the release/publish flow: never merges anywhere, and its
-#      name doesn't match any trigger in infra-charts' workflows.
+#      truefoundry) into its OWN release/tfy-llm-gateway-<its version>
+#      branch — pure reference so its incremental history is browsable even
+#      when its version diverges from the bundled branch above. Not part of
+#      the release/publish flow: never merges anywhere, and its name doesn't
+#      match any trigger in infra-charts' workflows.
 #
 # Nothing is ever released to gh-pages from a raw push to infra-charts main
 # for these two charts anymore — release.yaml explicitly excludes them on
@@ -54,7 +55,12 @@ jobs:
           TAG_NAME=${GITHUB_REF#refs/tags/}
           VERSION=$(echo "$TAG_NAME" | sed 's/truefoundry-//')
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
-          echo "INFRA_BRANCH=truefoundry-${VERSION}" >> "$GITHUB_ENV"
+          # release/ prefix keeps the branch out of chart-releaser's tag
+          # namespace: a branch named exactly truefoundry-<VERSION> collides
+          # with the truefoundry-<VERSION> tag chart-releaser mints in the
+          # same repo, and git short-ref resolution (actions/checkout,
+          # peter-evans/create-pull-request) breaks on the ambiguity.
+          echo "INFRA_BRANCH=release/truefoundry-${VERSION}" >> "$GITHUB_ENV"
 
       - name: Update chart version
         run: |
@@ -233,7 +239,9 @@ jobs:
         run: |
           GATEWAY_VERSION=$(yq e '.version' ./charts/tfy-llm-gateway/Chart.yaml)
           echo "GATEWAY_VERSION=$GATEWAY_VERSION" >> "$GITHUB_ENV"
-          echo "GATEWAY_BRANCH=tfy-llm-gateway-${GATEWAY_VERSION}" >> "$GITHUB_ENV"
+          # Same release/ prefix rationale as INFRA_BRANCH: avoid colliding
+          # with chart-releaser's tfy-llm-gateway-<VERSION> tag.
+          echo "GATEWAY_BRANCH=release/tfy-llm-gateway-${GATEWAY_VERSION}" >> "$GITHUB_ENV"
 
       - name: Ensure tfy-llm-gateway reference branch exists
         id: ensure_gateway_branch

@@ -97,7 +97,10 @@ jobs:
         if: steps.detect_charts.outputs.charts_to_release != ''
         env:
           GH_TOKEN: ${{ secrets.TF_GITHUB_CI_ADMIN_TOKEN }}
-          INFRA_BRANCH: ${{ steps.detect_charts.outputs.branch_suffix }}
+          # release/ prefix: a bare <chart>-<version> branch name collides
+          # with the identically-named tag chart-releaser mints in
+          # infra-charts, breaking git short-ref resolution on re-runs.
+          INFRA_BRANCH: release/${{ steps.detect_charts.outputs.branch_suffix }}
         run: |
           if gh api "repos/${INFRA_REPO}/git/ref/heads/${INFRA_BRANCH}" >/dev/null 2>&1; then
             echo "${INFRA_BRANCH} already exists in ${INFRA_REPO}"
@@ -113,7 +116,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: ${{ vars.INFRA_CHARTS_REPO || 'truefoundry/infra-charts' }}
-          ref: ${{ steps.detect_charts.outputs.branch_suffix }}
+          ref: release/${{ steps.detect_charts.outputs.branch_suffix }}
           token: ${{ secrets.TF_GITHUB_CI_ADMIN_TOKEN }}
           path: tmp_ahc
 
@@ -144,11 +147,11 @@ jobs:
         with:
           commit-message: '[CI] Publish charts ${{ steps.detect_charts.outputs.version_summary }}'
           branch: charts-${{ steps.detect_charts.outputs.branch_suffix }}
-          base: ${{ steps.detect_charts.outputs.branch_suffix }}
+          base: release/${{ steps.detect_charts.outputs.branch_suffix }}
           path: tmp_ahc
           title: '[CI] Publish charts ${{ steps.detect_charts.outputs.version_summary }}'
           body: |
-            Copies ${{ steps.detect_charts.outputs.version_summary }} from `truefoundry/helm-charts` into `charts/`, on infra-charts branch `${{ steps.detect_charts.outputs.branch_suffix }}` (not main — see this workflow's header comment).
+            Copies ${{ steps.detect_charts.outputs.version_summary }} from `truefoundry/helm-charts` into `charts/`, on infra-charts branch `release/${{ steps.detect_charts.outputs.branch_suffix }}` (not main — see this workflow's header comment).
 
             ---
             Source: `truefoundry/helm-charts` workflow `.github/workflows/release-public-charts.yaml`
