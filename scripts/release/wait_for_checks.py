@@ -27,7 +27,19 @@ from typing import Any
 from _lib import gh_api, run
 
 TERMINAL_STATUSES = {"completed"}
-FAILING_CONCLUSIONS = {"failure", "cancelled", "timed_out", "action_required"}
+# Every completed check-run conclusion that does NOT represent a pass.
+# startup_failure (workflow failed to even start, e.g. a broken YAML) and
+# stale (GitHub invalidated the run) both mean the check never succeeded —
+# treating them as passing would let the merge ladder proceed on a PR whose
+# gates never actually ran. Only success / neutral / skipped pass.
+FAILING_CONCLUSIONS = {
+    "failure",
+    "cancelled",
+    "timed_out",
+    "action_required",
+    "startup_failure",
+    "stale",
+}
 FAILING_STATUS_STATES = {"failure", "error"}
 
 
@@ -89,19 +101,68 @@ def main() -> int:
     parser.add_argument("--head-branch", required=True)
     parser.add_argument("--timeout-seconds", type=int, default=1800)
     parser.add_argument("--poll-seconds", type=int, default=15)
+    # How long "zero checks reported" must persist before it is believed.
+    # Checks attach to the commit ASYNCHRONOUSLY after a PR is opened or
+    # updated, and this script runs immediately after `gh pr create`/`edit` —
+    # inside the window where GitHub can report no checks even though
+    # workflows are about to queue. Returning success on the first empty
+    # response would let the merge ladder (including its plain-squash
+    # fallback, which branch protection does not reliably stop) merge before
+    # e.g. helm_test even starts — the exact premature-merge hole this
+    # script exists to close. Only after the grace window passes with
+    # consistently zero checks do we conclude the PR genuinely has none
+    # (e.g. no workflow's path/branch filters matched).
+    parser.add_argument("--no-checks-grace-seconds", type=int, default=120)
     args = parser.parse_args()
 
-    sha = resolve_head_sha(args.repo, args.head_branch)
-
     deadline = time.time() + args.timeout_seconds
+    # Checks are attached PER COMMIT, and other workflows can push new
+    # commits to the PR head while we wait (e.g. update-truefoundry-docs.yaml
+    # regenerating the README on release-branch PRs). Validating a pinned SHA
+    # while the head moves would pass checks on an OLD commit and let the
+    # merge ladder merge a NEWER, unvalidated one — so the head SHA is
+    # re-resolved on every iteration, and any movement restarts the wait
+    # (including the no-checks grace window, since a fresh commit's checks
+    # attach asynchronously all over again). The overall --timeout-seconds
+    # deadline is NOT reset by head movement.
+    sha: str | None = None
+    no_checks_deadline = time.time() + args.no_checks_grace_seconds
     while True:
+        current_sha = resolve_head_sha(args.repo, args.head_branch)
+        if current_sha != sha:
+            if sha is not None:
+                print(
+                    f"PR head moved {sha[:8]} -> {current_sha[:8]}; "
+                    "restarting the wait on the new commit",
+                )
+            sha = current_sha
+            no_checks_deadline = time.time() + args.no_checks_grace_seconds
+
         checks = fetch_checks(args.repo, sha)
-        if not checks:
-            print(
-                f"no checks reported for {args.head_branch}@{sha[:8]}; "
-                "nothing to wait for",
+
+        if time.time() > deadline:
+            pending_names = ", ".join(
+                c["name"] for c in checks if c["status"] not in TERMINAL_STATUSES
             )
-            return 0
+            raise TimeoutError(
+                f"timed out after {args.timeout_seconds}s waiting for checks "
+                f"on {args.head_branch}"
+                + (f": still pending: {pending_names}" if pending_names else ""),
+            )
+
+        if not checks:
+            if time.time() >= no_checks_deadline:
+                print(
+                    f"no checks reported for {args.head_branch}@{sha[:8]} "
+                    f"after {args.no_checks_grace_seconds}s; nothing to wait for",
+                )
+                return 0
+            print(
+                f"no checks reported yet for {args.head_branch}@{sha[:8]}; "
+                "waiting for checks to attach...",
+            )
+            time.sleep(args.poll_seconds)
+            continue
 
         pending = [c for c in checks if c["status"] not in TERMINAL_STATUSES]
         if not pending:
@@ -116,18 +177,22 @@ def main() -> int:
                 raise RuntimeError(
                     f"check(s) failed on {args.head_branch}@{sha[:8]}: {names}",
                 )
+            # Final consistency guard: the head may have moved between the
+            # resolve at the top of this iteration and now. Only declare
+            # success if the checks we just validated belong to the commit
+            # that is STILL the PR head; otherwise loop and re-validate.
+            if resolve_head_sha(args.repo, args.head_branch) != sha:
+                print(
+                    f"PR head moved after checks passed on {sha[:8]}; "
+                    "re-validating the new commit",
+                )
+                continue
             print(
                 f"all {len(checks)} check(s) passed for "
                 f"{args.head_branch}@{sha[:8]}",
             )
             return 0
 
-        if time.time() > deadline:
-            names = ", ".join(c["name"] for c in pending)
-            raise TimeoutError(
-                f"timed out after {args.timeout_seconds}s waiting for checks "
-                f"on {args.head_branch}: still pending: {names}",
-            )
         time.sleep(args.poll_seconds)
 
 
