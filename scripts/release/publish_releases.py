@@ -240,7 +240,28 @@ def emit_output(key: str, value: str) -> None:
         handle.write(f"{key}={value}\n")
 
 
-def ensure_release(repo: str, tag: str, sha: str, prerelease: bool, notes: str) -> None:
+def ensure_release(
+    repo: str,
+    tag: str,
+    sha: str,
+    prerelease: bool,
+    notes: str,
+    latest: bool | None = None,
+) -> None:
+    """Create/refresh the GitHub Release for `tag`.
+
+    `latest` controls the repo's "Latest" badge: GitHub marks the newest-
+    CREATED release as latest by default, so an older-line hotfix (e.g.
+    v0.140.6 shipped after v0.148.0) would steal the badge from the actual
+    newest version. Callers pass fast_forward_main (true only when this
+    release is at/above the latest shipped line). None leaves gh's default
+    untouched; the flag is never sent for prereleases (GitHub forbids
+    marking a prerelease as latest).
+    """
+    latest_flags: list[str] = []
+    if latest is not None and not prerelease:
+        latest_flags = [f"--latest={'true' if latest else 'false'}"]
+
     exists = run(["gh", "release", "view", tag, "--repo", repo], check=False)
     if exists.returncode == 0:
         run(
@@ -258,6 +279,7 @@ def ensure_release(repo: str, tag: str, sha: str, prerelease: bool, notes: str) 
                 # gh treats --prerelease as a boolean flag; the value must be
                 # attached with '=' or '--prerelease false' is parsed as true.
                 f"--prerelease={'true' if prerelease else 'false'}",
+                *latest_flags,
             ],
         )
         return
@@ -275,6 +297,7 @@ def ensure_release(repo: str, tag: str, sha: str, prerelease: bool, notes: str) 
         tag,
         "--notes",
         notes,
+        *latest_flags,
     ]
     if prerelease:
         command.append("--prerelease")
@@ -319,7 +342,12 @@ def subcommand_per_service(args: argparse.Namespace) -> int:
     previous_tag = resolve_previous_tag(spec, repo, tag)
     notes = generate_notes(repo, tag, sha, previous_tag=previous_tag)
     ensure_tag(repo, tag, sha)
-    ensure_release(repo, tag, sha, prerelease, notes)
+    # Only a latest-line final may take the repo's "Latest" badge; an
+    # older-line hotfix final must not steal it from the newest version.
+    ensure_release(
+        repo, tag, sha, prerelease, notes,
+        latest=bool(spec.get("fast_forward_main")),
+    )
 
     # Surface the PRs that went into this service's release + the release URL so
     # the workflow can forward them to release-app (stored in
@@ -358,7 +386,11 @@ def subcommand_helm_charts(args: argparse.Namespace) -> int:
     notes = "\n".join(lines)
     # Chart tag is truefoundry-X.Y.Z[-rc.N]; pre-release iff it carries -rc.
     prerelease = is_prerelease_version(tag)
-    ensure_release(repo, tag, sha, prerelease, notes)
+    # Same "Latest"-badge rule as per-service releases: only latest-line finals.
+    ensure_release(
+        repo, tag, sha, prerelease, notes,
+        latest=bool(spec.get("fast_forward_main")),
+    )
     return 0
 
 
