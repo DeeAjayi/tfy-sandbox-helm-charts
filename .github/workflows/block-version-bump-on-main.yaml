@@ -22,6 +22,11 @@ on:
 
 jobs:
   block-version-bump:
+    # The release pipeline's own promote-to-main PRs use the release branch
+    # itself as the PR head (release-vX.Y.Z -> main, see release-helm-update.yml)
+    # and are the ONE sanctioned way chart versions reach main — skip those.
+    # Everything else (feature branches, manual bumps) stays blocked.
+    if: ${{ !startsWith(github.head_ref, 'release-v') }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
