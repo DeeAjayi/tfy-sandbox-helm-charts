@@ -12,32 +12,62 @@
 # failing check is marked required.
 name: Block version bump on main
 
+# NOTE: no `paths:` filter, deliberately — this job is wired as a REQUIRED
+# status check on main, and a required check that never reports (because the
+# PR didn't touch the filtered paths) shows as "Expected" and blocks the
+# merge forever. Running on every PR is cheap: the version-diff below no-ops
+# when the Chart.yaml files didn't change.
 on:
   pull_request:
     branches:
       - main
-    paths:
-      - 'charts/truefoundry/Chart.yaml'
-      - 'charts/tfy-llm-gateway/Chart.yaml'
 
 jobs:
   block-version-bump:
-    # The release pipeline's own promote-to-main PRs use the release branch
-    # itself as the PR head (release-vX.Y.Z -> main, see release-helm-update.yml)
-    # and are the ONE sanctioned way chart versions reach main — skip those.
-    # Everything else (feature branches, manual bumps) stays blocked.
-    if: ${{ !startsWith(github.head_ref, 'release-v') }}
+    # NOTE: the promote-PR exemption below is implemented as step-level
+    # conditions (job always runs, reports an explicit SUCCESS for exempt
+    # PRs) rather than a job-level `if` that skips the whole job. This job
+    # is wired as a REQUIRED status check; an explicit success removes any
+    # dependence on GitHub's "skipped check satisfies required checks"
+    # semantics, which differ between skip mechanisms and have changed
+    # historically.
     runs-on: ubuntu-latest
     steps:
+      # The release pipeline's own promote-to-main PRs use the release branch
+      # itself as the PR head (release-vX.Y.Z -> main, see
+      # release-helm-update.yml) and are the ONE sanctioned way chart
+      # versions reach main — pass those explicitly. The exemption is
+      # deliberately strict: the head must live in THIS repo (a fork branch
+      # named release-v* is not a pipeline promote) and must match the exact
+      # release-vX.Y.Z semver shape (a prefix-only match would also exempt
+      # e.g. release-v-experiment). GitHub expressions have no regex, so the
+      # match is done in shell here.
+      - name: Determine whether this is a sanctioned promote PR
+        id: promote
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+        run: |
+          if [ "$HEAD_REPO" = "$GITHUB_REPOSITORY" ] \
+             && printf '%s' "$HEAD_REF" | grep -Eq '^release-v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "exempt=true" >> "$GITHUB_OUTPUT"
+            echo "Head branch '$HEAD_REF' is this repo's own release branch promote — version bumps are expected here."
+          else
+            echo "exempt=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Checkout
+        if: ${{ steps.promote.outputs.exempt == 'false' }}
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
       - name: Fetch PR base commit
+        if: ${{ steps.promote.outputs.exempt == 'false' }}
         run: git fetch --depth=1 origin "${{ github.event.pull_request.base.sha }}"
 
       - name: Fail if Chart.yaml version changed
+        if: ${{ steps.promote.outputs.exempt == 'false' }}
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |

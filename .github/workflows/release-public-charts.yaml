@@ -102,7 +102,14 @@ jobs:
           # infra-charts, breaking git short-ref resolution on re-runs.
           INFRA_BRANCH: release/${{ steps.detect_charts.outputs.branch_suffix }}
         run: |
-          if gh api "repos/${INFRA_REPO}/git/ref/heads/${INFRA_BRANCH}" >/dev/null 2>&1; then
+          # Exact-ref existence check. The '/' in the branch name is
+          # %-encoded so the refs API sees a single ref segment (same
+          # convention as scripts/release/ensure_service_branches.py), and the
+          # RESOLVED ref name is compared rather than trusting the exit code
+          # alone.
+          ENCODED_BRANCH="${INFRA_BRANCH//\//%2F}"
+          FOUND_REF=$(gh api "repos/${INFRA_REPO}/git/ref/heads/${ENCODED_BRANCH}" --jq '.ref' 2>/dev/null || true)
+          if [ "$FOUND_REF" = "refs/heads/${INFRA_BRANCH}" ]; then
             echo "${INFRA_BRANCH} already exists in ${INFRA_REPO}"
             exit 0
           fi
