@@ -121,8 +121,8 @@ jobs:
           # the same commit can't be merged past.
           python3 scripts/release/wait_for_checks.py --repo "$INFRA_REPO" --head-branch "inframold-${{ inputs.version }}"
           gh pr merge "${{ steps.find.outputs.pr_number }}" -R "$INFRA_REPO" --squash --admin --delete-branch
-          merged=$(gh pr view "${{ steps.find.outputs.pr_number }}" -R "$INFRA_REPO" --json merged --jq '.merged')
-          [ "$merged" = "true" ] || { echo "::error::inframold PR not merged"; exit 1; }
+          state=$(gh pr view "${{ steps.find.outputs.pr_number }}" -R "$INFRA_REPO" --json state --jq '.state')
+          [ "$state" = "MERGED" ] || { echo "::error::inframold PR not merged"; exit 1; }
 
       - name: Notify result
         if: ${{ always() }}

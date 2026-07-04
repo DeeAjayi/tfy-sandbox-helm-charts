@@ -364,10 +364,10 @@ jobs:
           BR="deploy-develop-truefoundry-${VER}"
           # Same sandbox/fork overrides deploy.py itself uses.
           UBERMOLD="${{ vars.UBERMOLD_ORG || 'truefoundry' }}/${{ vars.UBERMOLD_BASE_REPO || 'ubermold-base' }}"
-          merged=$(gh pr list -R "$UBERMOLD" --head "$BR" \
-            --state all --json merged --jq '.[0].merged // empty' || echo "")
-          echo "develop PR ($BR) merged=${merged:-<no PR>}"
-          if [ -n "$merged" ] && [ "$merged" != "true" ]; then
+          state=$(gh pr list -R "$UBERMOLD" --head "$BR" \
+            --state all --json state --jq '.[0].state // empty' || echo "")
+          echo "develop PR ($BR) state=${state:-<no PR>}"
+          if [ -n "$state" ] && [ "$state" != "MERGED" ]; then
             echo "::error::develop PR $BR exists but is not merged"; exit 1
           fi
       - name: Notify release-app — deploy_develop

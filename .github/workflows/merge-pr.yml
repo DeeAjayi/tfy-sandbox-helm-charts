@@ -119,6 +119,6 @@ jobs:
       - name: Confirm merged
         run: |
           set -euo pipefail
-          merged=$(gh pr view "${{ inputs.pr_number }}" -R "${{ inputs.repo }}" --json merged --jq '.merged')
-          [ "$merged" = "true" ] || { echo "::error::merge did not take effect"; exit 1; }
+          state=$(gh pr view "${{ inputs.pr_number }}" -R "${{ inputs.repo }}" --json state --jq '.state')
+          [ "$state" = "MERGED" ] || { echo "::error::merge did not take effect"; exit 1; }
           echo "Merged ${{ inputs.repo }}#${{ inputs.pr_number }}"

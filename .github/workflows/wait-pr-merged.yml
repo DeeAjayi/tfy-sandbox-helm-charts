@@ -51,10 +51,9 @@ jobs:
           set -euo pipefail
           deadline=$(( $(date +%s) + ${{ inputs.timeout_seconds }} ))
           while :; do
-            merged=$(gh pr view "${{ inputs.pr_number }}" -R "${{ inputs.repo }}" --json merged --jq '.merged' || echo "error")
-            state=$(gh pr view "${{ inputs.pr_number }}" -R "${{ inputs.repo }}" --json state --jq '.state' || echo "")
-            echo "PR ${{ inputs.repo }}#${{ inputs.pr_number }}: merged=$merged state=$state"
-            if [ "$merged" = "true" ]; then
+            state=$(gh pr view "${{ inputs.pr_number }}" -R "${{ inputs.repo }}" --json state --jq '.state' || echo "error")
+            echo "PR ${{ inputs.repo }}#${{ inputs.pr_number }}: state=$state"
+            if [ "$state" = "MERGED" ]; then
               echo "PR merged."; exit 0
             fi
             # A PR closed WITHOUT merging is a hard failure (someone declined it).
