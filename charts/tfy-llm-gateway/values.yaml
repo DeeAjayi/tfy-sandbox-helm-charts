@@ -1,6 +1,6 @@
 global:
-  gatewayChartVersion: "0.2.0-rc.1"
+  gatewayChartVersion: "0.2.0"
 
 image:
   repository: ghcr.io/deeajayi/tfy-sandbox-gateway
-  tag: v0.2.0-rc.1
+  tag: v0.2.0
