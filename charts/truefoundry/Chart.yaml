@@ -1,11 +1,11 @@
 apiVersion: v2
 name: truefoundry
-version: 0.2.0-rc.1
+version: 0.2.0
 description: "Sandbox stand-in for the TrueFoundry umbrella chart"
 maintainers:
   - name: sandbox
 dependencies:
   - name: tfy-llm-gateway
     repository: oci://ghcr.io/deeajayi/tfy-sandbox-helm
-    version: 0.2.0-rc.1
+    version: 0.2.0
     condition: tfy-llm-gateway.enabled
