@@ -167,8 +167,8 @@ jobs:
           # Same all-checks gate as the two merges above.
           python3 scripts/release/wait_for_checks.py --repo "$UB_REPO" --head-branch main
           gh pr merge "$PR" -R "$UB_REPO" --merge --admin --delete-branch
-          merged=$(gh pr view "$PR" -R "$UB_REPO" --json merged --jq '.merged')
-          [ "$merged" = "true" ] || { echo "::error::back-merge PR #$PR not merged"; exit 1; }
+          state=$(gh pr view "$PR" -R "$UB_REPO" --json state --jq '.state')
+          [ "$state" = "MERGED" ] || { echo "::error::back-merge PR #$PR not merged"; exit 1; }
 
       - name: Notify infra_inframold (opened/held) + back-merge
         if: ${{ always() }}
