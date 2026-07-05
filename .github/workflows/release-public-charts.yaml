@@ -120,7 +120,7 @@ jobs:
 
       - name: Checkout charts
         if: steps.detect_charts.outputs.charts_to_release != ''
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: ${{ vars.INFRA_CHARTS_REPO || 'truefoundry/infra-charts' }}
           ref: release/${{ steps.detect_charts.outputs.branch_suffix }}
@@ -137,7 +137,7 @@ jobs:
 
       - name: Set up Helm
         if: steps.detect_charts.outputs.charts_to_release != ''
-        uses: azure/setup-helm@v4.3.0
+        uses: azure/setup-helm@v5
         with:
           version: v3.17.3
 
@@ -150,7 +150,7 @@ jobs:
 
       - name: Create Pull Request
         if: steps.detect_charts.outputs.charts_to_release != ''
-        uses: peter-evans/create-pull-request@v7
+        uses: peter-evans/create-pull-request@v8
         with:
           commit-message: '[CI] Publish charts ${{ steps.detect_charts.outputs.version_summary }}'
           branch: charts-${{ steps.detect_charts.outputs.branch_suffix }}

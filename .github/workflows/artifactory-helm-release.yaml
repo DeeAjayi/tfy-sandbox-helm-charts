@@ -71,7 +71,7 @@ jobs:
 
       - name: Set up Helm
         if: steps.detect_charts.outputs.charts_to_release != ''
-        uses: azure/setup-helm@v4.3.0
+        uses: azure/setup-helm@v5
         with:
           version: v3.17.3
 
@@ -96,7 +96,7 @@ jobs:
 
       - name: Set up Python
         if: steps.detect_charts.outputs.charts_to_release != ''
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.11'
 

@@ -60,7 +60,7 @@ jobs:
       # wait_for_checks.py lives in this repo — the same hardened gate the
       # core pipeline merges with (no-checks grace window, head-move
       # re-resolution, startup_failure/stale treated as failures).
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Wait for required workflow/check on PR
         if: ${{ inputs.wait_for_workflow != '' }}
