@@ -140,6 +140,32 @@ jobs:
           state=$(gh pr view "$PR" -R "$UB_REPO" --json state --jq '.state')
           [ "$state" = "MERGED" ] || { echo "::error::develop->main not merged"; exit 1; }
 
+      # The develop->main merge carries whatever develop holds AT MERGE TIME.
+      # Our pin (the targetRevision sed above) happens moments earlier, so a
+      # NEW line's RC deploy merging into develop inside that window would
+      # ride an -rc targetRevision into main silently. Turn that leak into a
+      # loud failure: main must never reference a release candidate.
+      - name: Assert main carries no RC targetRevision
+        env:
+          GH_TOKEN: ${{ secrets.TF_GITHUB_CI_ADMIN_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Fetch by blob sha (not path): cookiecutter template paths contain
+          # jinja braces that don't survive URL encoding in the contents API.
+          leaked=$(gh api "repos/$UB_REPO/git/trees/main?recursive=1" \
+            --jq '.tree[] | select(.path | test("^k8s/.*truefoundry\\.yaml")) | "\(.sha) \(.path)"' \
+            | while read -r sha p; do
+                rev=$(gh api "repos/$UB_REPO/git/blobs/$sha" \
+                  --jq '.content' | base64 -d | grep -Eo 'targetRevision:[[:space:]]*[^[:space:]]+' || true)
+                case "$rev" in *-rc.*) echo "$p -> $rev";; esac
+              done)
+          if [ -n "$leaked" ]; then
+            echo "::error::RC targetRevision leaked into $UB_REPO main:"
+            echo "$leaked"
+            exit 1
+          fi
+          echo "main carries no -rc targetRevision — clean."
+
       - name: Back-merge main -> develop
         id: backmerge
         run: |
