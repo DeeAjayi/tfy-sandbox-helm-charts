@@ -1,5 +1,5 @@
 global:
-  controlPlaneChartVersion: "0.2.0"
+  controlPlaneChartVersion: "0.3.0"
 
 # test chart
 tfy-llm-gateway:
@@ -8,4 +8,4 @@ tfy-llm-gateway:
 sandboxService:
   image:
     repository: ghcr.io/deeajayi/tfy-sandbox-service
-    tag: v0.2.0
+    tag: v0.3.0
