@@ -138,7 +138,8 @@ jobs:
           # IMMEDIATE merge that bypasses branch protection, so without this a
           # gitops check still running (or already failed) wouldn't stop it.
           python3 scripts/release/wait_for_checks.py --repo "$GITOPS_REPO" --head-branch "$BRANCH"
-          gh pr merge "$PR" -R "$GITOPS_REPO" --squash --admin --delete-branch
+          gh pr merge "$PR" -R "$GITOPS_REPO" --squash --admin --delete-branch \
+            || echo "merge command failed; verifying PR state (may already be merged)"
           state=$(gh pr view "$PR" -R "$GITOPS_REPO" --json state --jq '.state')
           [ "$state" = "MERGED" ] || { echo "::error::gitops PR not merged"; exit 1; }
 
