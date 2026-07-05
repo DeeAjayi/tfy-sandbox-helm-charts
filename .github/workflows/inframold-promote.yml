@@ -121,7 +121,8 @@ jobs:
           # check wouldn't otherwise stop it). Script lives in the helm-charts
           # checkout at the workspace root (this step runs in ub/).
           python3 ../scripts/release/wait_for_checks.py --repo "$UB_REPO" --head-branch "$BR"
-          gh pr merge "$PR" -R "$UB_REPO" --squash --admin --delete-branch
+          gh pr merge "$PR" -R "$UB_REPO" --squash --admin --delete-branch \
+            || echo "merge command failed; verifying PR state (may already be merged)"
 
       - name: Promote develop -> main (MERGE COMMIT, no squash)
         run: |
@@ -134,7 +135,8 @@ jobs:
           [ -n "$PR" ] || { echo "::error::could not create or find the develop->main promote PR"; exit 1; }
           # Same all-checks gate as every other pipeline merge.
           python3 scripts/release/wait_for_checks.py --repo "$UB_REPO" --head-branch develop
-          gh pr merge "$PR" -R "$UB_REPO" --merge --admin
+          gh pr merge "$PR" -R "$UB_REPO" --merge --admin \
+            || echo "merge command failed; verifying PR state (may already be merged)"
           state=$(gh pr view "$PR" -R "$UB_REPO" --json state --jq '.state')
           [ "$state" = "MERGED" ] || { echo "::error::develop->main not merged"; exit 1; }
 
@@ -166,7 +168,8 @@ jobs:
           PR="${PR_URL##*/}"
           # Same all-checks gate as the two merges above.
           python3 scripts/release/wait_for_checks.py --repo "$UB_REPO" --head-branch main
-          gh pr merge "$PR" -R "$UB_REPO" --merge --admin --delete-branch
+          gh pr merge "$PR" -R "$UB_REPO" --merge --admin --delete-branch \
+            || echo "merge command failed; verifying PR state (may already be merged)"
           state=$(gh pr view "$PR" -R "$UB_REPO" --json state --jq '.state')
           [ "$state" = "MERGED" ] || { echo "::error::back-merge PR #$PR not merged"; exit 1; }
 

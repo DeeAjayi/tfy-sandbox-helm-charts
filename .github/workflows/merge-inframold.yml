@@ -120,7 +120,8 @@ jobs:
           # other pipeline merge) so an unrelated failing/in-progress check on
           # the same commit can't be merged past.
           python3 scripts/release/wait_for_checks.py --repo "$INFRA_REPO" --head-branch "inframold-${{ inputs.version }}"
-          gh pr merge "${{ steps.find.outputs.pr_number }}" -R "$INFRA_REPO" --squash --admin --delete-branch
+          gh pr merge "${{ steps.find.outputs.pr_number }}" -R "$INFRA_REPO" --squash --admin --delete-branch \
+            || echo "merge command failed; verifying PR state (may already be merged)"
           state=$(gh pr view "${{ steps.find.outputs.pr_number }}" -R "$INFRA_REPO" --json state --jq '.state')
           [ "$state" = "MERGED" ] || { echo "::error::inframold PR not merged"; exit 1; }
 

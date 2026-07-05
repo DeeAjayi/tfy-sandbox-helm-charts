@@ -24,7 +24,7 @@ import sys
 import time
 from typing import Any
 
-from _lib import run
+from _lib import gh_api, run
 
 TERMINAL_STATUSES = {"completed"}
 # Every completed check-run conclusion that does NOT represent a pass.
@@ -43,7 +43,11 @@ FAILING_CONCLUSIONS = {
 FAILING_STATUS_STATES = {"failure", "error"}
 
 
-def resolve_head_sha(repo: str, head_branch: str) -> str:
+def resolve_head_sha(repo: str, head_branch: str) -> str | None:
+    """Head SHA of the newest OPEN PR for the branch, or None when the PR was
+    merged while we waited (checks-gate-before-merge already satisfied — the
+    merge happened; there is nothing left to gate). A PR closed WITHOUT
+    merging still raises: the thing we were gating was abandoned."""
     result = run(
         [
             "gh", "pr", "list", "--repo", repo, "--head", head_branch,
@@ -52,6 +56,14 @@ def resolve_head_sha(repo: str, head_branch: str) -> str:
     )
     prs = json.loads(result.stdout)
     if not prs:
+        merged = run(
+            [
+                "gh", "pr", "list", "--repo", repo, "--head", head_branch,
+                "--state", "merged", "--json", "number",
+            ],
+        )
+        if json.loads(merged.stdout):
+            return None
         raise RuntimeError(f"no open PR found for head branch {head_branch!r} in {repo}")
     # A head branch could in theory have more than one PR across re-runs;
     # the highest PR number is the one from this run.
@@ -59,53 +71,31 @@ def resolve_head_sha(repo: str, head_branch: str) -> str:
     return pr["headRefOid"]
 
 
-def _gh_api_all_pages(path: str) -> list[dict[str, Any]]:
-    """GET a paginated endpoint, returning the parsed page objects as a list.
-
-    `--slurp` wraps the pages in a JSON array (plain `--paginate` concatenates
-    JSON documents, which json.loads can't parse for object responses).
-    """
-    result = run(["gh", "api", "--paginate", "--slurp", path], check=False)
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"gh api {path} failed: "
-            f"{result.stderr.strip() or result.stdout.strip() or 'unknown error'}",
-        )
-    return json.loads(result.stdout) if result.stdout.strip() else []
-
-
 def fetch_checks(repo: str, sha: str) -> list[dict[str, Any]]:
     checks: list[dict[str, Any]] = []
 
-    # Paginated: GitHub returns at most 30 check runs per page by default —
-    # a busy commit can exceed one page, and a missing page could hide an
-    # in-progress or failing check, letting the merge ladder proceed early.
-    for page in _gh_api_all_pages(
-        f"repos/{repo}/commits/{sha}/check-runs?per_page=100",
-    ):
-        for item in (page or {}).get("check_runs", []):
-            checks.append(
-                {
-                    "name": item.get("name"),
-                    "status": item.get("status"),
-                    "conclusion": item.get("conclusion"),
-                },
-            )
+    check_runs = gh_api(f"repos/{repo}/commits/{sha}/check-runs") or {}
+    for item in check_runs.get("check_runs", []):
+        checks.append(
+            {
+                "name": item.get("name"),
+                "status": item.get("status"),
+                "conclusion": item.get("conclusion"),
+            },
+        )
 
     # Legacy commit-status API — some external CI reports here instead of as
     # a check-run. Combined per-context, latest state only.
-    for page in _gh_api_all_pages(
-        f"repos/{repo}/commits/{sha}/status?per_page=100",
-    ):
-        for item in (page or {}).get("statuses", []):
-            state = item.get("state")
-            checks.append(
-                {
-                    "name": item.get("context"),
-                    "status": "in_progress" if state == "pending" else "completed",
-                    "conclusion": state,
-                },
-            )
+    combined = gh_api(f"repos/{repo}/commits/{sha}/status") or {}
+    for item in combined.get("statuses", []):
+        state = item.get("state")
+        checks.append(
+            {
+                "name": item.get("context"),
+                "status": "in_progress" if state == "pending" else "completed",
+                "conclusion": state,
+            },
+        )
 
     return checks
 
@@ -151,6 +141,12 @@ def main() -> int:
     no_checks_deadline = time.time() + args.no_checks_grace_seconds
     while True:
         current_sha = resolve_head_sha(args.repo, args.head_branch)
+        if current_sha is None:
+            print(
+                f"PR for {args.head_branch} was merged while waiting; "
+                "nothing left to gate",
+            )
+            return 0
         if current_sha != sha:
             if sha is not None:
                 print(
