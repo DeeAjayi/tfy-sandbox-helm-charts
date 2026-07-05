@@ -318,12 +318,23 @@ jobs:
     needs:
       - compute_release
       - publish_releases
+      - helm
+    # `needs.helm.result == 'success'` is load-bearing: publish_releases
+    # succeeds even when the chart merge failed (service releases are
+    # deliberately decoupled from helm; merge_pr is ANDed with helm success
+    # above, so the chart release is just skipped). Deploys point clusters at
+    # spec.tag — a chart revision that only exists once the helm PR merged
+    # into the release branch (which is also what publishes it to OCI) — so a
+    # failed helm merge must skip the deploy, not ride past it. deploy-only
+    # mode trusts the operator-supplied version and skips the whole pipeline,
+    # so it deliberately doesn't check helm.
     if: >-
       ${{ !cancelled()
           && (
             (inputs.deploy_only
               && (inputs.kind == 'rc' || inputs.kind == 'prod' || inputs.kind == 'hotfix'))
             || (needs.publish_releases.result == 'success'
+              && needs.helm.result == 'success'
               && (inputs.kind == 'rc'
                 || inputs.kind == 'prod'
                 || (inputs.kind == 'hotfix'
@@ -460,14 +471,22 @@ jobs:
       - compute_release
       - publish_releases
       - verify_truefoundry_oci
-    # cp-prod path also requires the OCI availability gate (verify_truefoundry_oci)
-    # to have succeeded. In deploy-only mode that gate is skipped and not required.
+      - helm
+    # Two extra gates beyond publish success (which deliberately tolerates a
+    # failed chart merge — service releases are decoupled from helm):
+    #   - helm success: a failed chart merge must never bump prod's
+    #     targetRevision to a revision that never merged/shipped;
+    #   - verify_truefoundry_oci: the chart must be pull-able from OCI before
+    #     prod points at it.
+    # In deploy-only mode both gates are skipped and not required (operator-
+    # supplied version, pipeline never ran).
     if: >-
       ${{ !cancelled()
           && (
             (inputs.deploy_only
               && (inputs.kind == 'prod' || inputs.kind == 'hotfix'))
             || (needs.publish_releases.result == 'success'
+              && needs.helm.result == 'success'
               && needs.verify_truefoundry_oci.result == 'success'
               && (inputs.kind == 'prod' || inputs.kind == 'hotfix')
               && fromJSON(needs.compute_release.outputs.spec || '{}').fast_forward_main == true)
