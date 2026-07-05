@@ -215,12 +215,36 @@ def image_names(component: dict[str, Any]) -> list[tuple[str, str, list[str]]]:
     return [(image_name, default_registry, build_suffixes)]
 
 
+def _manifest_digest(ref: str) -> str | None:
+    result = run(
+        ["docker", "buildx", "imagetools", "inspect", ref, "--format", "{{.Manifest.Digest}}"],
+        check=False,
+    )
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
 def copy_tag(image: str, source_tag: str, target_tag: str) -> None:
     source_ref = f"{image}:{source_tag}"
     target_ref = f"{image}:{target_tag}"
-    exists = run(["docker", "manifest", "inspect", source_ref], check=False)
-    if exists.returncode != 0:
+    source_digest = _manifest_digest(source_ref)
+    if source_digest is None:
         raise RuntimeError(f"source tag missing: {source_ref}")
+
+    # Final tags are immutable once published. A re-run whose copy would be a
+    # no-op (same digest) is fine; anything that would RE-POINT an existing
+    # final tag to different bits is refused — a published version must never
+    # silently change under customers. If a re-point is truly intended, delete
+    # the registry tag deliberately first.
+    target_digest = _manifest_digest(target_ref)
+    if target_digest is not None:
+        if target_digest == source_digest:
+            print(f"{target_ref} already exists with the same digest; skipping copy.")
+            return
+        raise RuntimeError(
+            f"refusing to overwrite {target_ref}: it exists with digest "
+            f"{target_digest}, but {source_ref} is {source_digest}. Published "
+            "final tags are immutable.",
+        )
 
     # `imagetools create` copies the source manifest to the target tag registry-
     # side, preserving the FULL (possibly multi-arch) manifest list. The old
