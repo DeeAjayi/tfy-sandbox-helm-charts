@@ -179,8 +179,11 @@ jobs:
           # The success note must only accompany a SUCCESS — pairing a failed
           # phase with "develop->main merged; PR opened" text misleads
           # release-app operators about what actually happened.
+          # Carry the computed IV so release-app records tail.inframold_version
+          # directly — merge_inframold then needs no PR-discovery fallback.
+          IV='${{ steps.ver.outputs.next }}'
           if [ "${{ job.status }}" = "success" ]; then
-            DATA='{"note": "develop->main merged; infra-charts #2928 opened and HELD for merge-inframold"}'
+            DATA='{"note": "develop->main merged; inframold PR opened and HELD for merge-inframold", "inframold_version": "'"$IV"'"}'
           else
             DATA='{"note": "inframold promote FAILED — check the run logs; develop->main may not have merged"}'
           fi
