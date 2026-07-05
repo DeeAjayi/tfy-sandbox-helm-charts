@@ -31,7 +31,11 @@ env:
   RELEASE_APP_CALLBACK_TOKEN: ${{ secrets.RELEASE_APP_CALLBACK_TOKEN }}
   # Override via repo variable INFRA_CHARTS_REPO for sandbox/fork testing.
   INFRA_REPO: ${{ vars.INFRA_CHARTS_REPO || 'truefoundry/infra-charts' }}
-  ARTIFACTS_WORKFLOW: "Generate Inframold Charts Artifacts Manifest"
+  # The infra-charts workflow FILE that generates the artifacts manifest on
+  # inframold PRs. Matched by file via the Actions runs API — NOT by check-run
+  # name: check-runs are named after JOBS (changes / update-artifacts /
+  # artifact-generation-gate in prod), so a workflow-name regex never matches.
+  ARTIFACTS_WORKFLOW_FILE: ${{ vars.INFRA_ARTIFACTS_WORKFLOW_FILE || 'update-artifacts.yml' }}
 
 jobs:
   merge:
@@ -94,11 +98,13 @@ jobs:
             if [ "$CUR" != "$SHA" ]; then
               [ -n "$SHA" ] && echo "PR head moved ${SHA:0:8} -> ${CUR:0:8}; restarting the wait"
               SHA="$CUR"
-              echo "PR head SHA: $SHA ; waiting for '$ARTIFACTS_WORKFLOW'"
+              echo "PR head SHA: $SHA ; waiting for '$ARTIFACTS_WORKFLOW_FILE'"
             fi
-            concl=$(gh api "repos/$INFRA_REPO/commits/$SHA/check-runs" \
-              --jq "[.check_runs[] | select(.name | test(\"$ARTIFACTS_WORKFLOW\"; \"i\"))] | last | .conclusion" 2>/dev/null || echo "")
-            echo "conclusion=$concl"
+            # Resolve the workflow RUN for this head commit by workflow FILE
+            # (robust to job renames; check-run names are job names).
+            concl=$(gh api "repos/$INFRA_REPO/actions/workflows/$ARTIFACTS_WORKFLOW_FILE/runs?head_sha=$SHA&per_page=5" \
+              --jq '[.workflow_runs[]] | sort_by(.run_started_at) | last | .conclusion // "in_progress"' 2>/dev/null || echo "")
+            echo "conclusion=${concl:-<no run yet>}"
             if [ "$concl" = "success" ]; then
               # Only accept if the validated commit is STILL the PR head.
               FINAL=$(gh pr view "${{ steps.find.outputs.pr_number }}" -R "$INFRA_REPO" --json headRefOid --jq '.headRefOid')
@@ -106,9 +112,9 @@ jobs:
               echo "head moved after success on ${SHA:0:8}; re-validating"; continue
             fi
             if [ "$concl" = "failure" ] || [ "$concl" = "cancelled" ] || [ "$concl" = "timed_out" ]; then
-              echo "::error::'$ARTIFACTS_WORKFLOW' concluded '$concl'"; exit 1
+              echo "::error::'$ARTIFACTS_WORKFLOW_FILE' concluded '$concl'"; exit 1
             fi
-            [ "$(date +%s)" -ge "$deadline" ] && { echo "::error::timed out waiting for '$ARTIFACTS_WORKFLOW'"; exit 1; }
+            [ "$(date +%s)" -ge "$deadline" ] && { echo "::error::timed out waiting for '$ARTIFACTS_WORKFLOW_FILE'"; exit 1; }
             sleep 15
           done
 
