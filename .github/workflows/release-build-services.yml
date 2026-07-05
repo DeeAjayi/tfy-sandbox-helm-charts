@@ -27,7 +27,7 @@ jobs:
   notify_start:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Notify release-app — build running
         run: |
           python3 scripts/release/callback.py \
@@ -46,7 +46,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout helm-charts
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install python dependencies
         run: |
@@ -114,7 +114,7 @@ jobs:
           PY
 
       - name: Upload build result
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: build-result-${{ steps.slug.outputs.value }}
           path: result/result.json
@@ -127,8 +127,8 @@ jobs:
       tag_map: ${{ steps.summary.outputs.tag_map }}
       commit_map: ${{ steps.summary.outputs.commit_map }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v6
         # A chart-only hotfix skips `legs` entirely (empty repos), so there
         # are no build-result-* artifacts to find; don't fail the job over it
         # — build_summary.py already tolerates a missing artifact-dir.
