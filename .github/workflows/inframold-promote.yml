@@ -50,13 +50,13 @@ jobs:
       inframold_version: ${{ steps.ver.outputs.next }}
     steps:
       - name: Checkout helm-charts (for callback.py)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Notify running
         run: python3 scripts/release/callback.py --phase infra_inframold --status running
 
       - name: Checkout ubermold-base (develop)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: ${{ env.UB_REPO }}
           ref: develop

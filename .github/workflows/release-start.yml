@@ -86,7 +86,7 @@ jobs:
       branch: ${{ steps.compute.outputs.branch }}
       mode: ${{ steps.compute.outputs.mode }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
       # Mark the phase running at job start so release-app records a real start
@@ -133,7 +133,7 @@ jobs:
       group: ensure-branches-${{ needs.compute_release.outputs.branch }}
       cancel-in-progress: false
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Notify release-app — branches running
         run: |
           python3 scripts/release/callback.py \
@@ -180,7 +180,7 @@ jobs:
       group: retag-${{ needs.compute_release.outputs.target_version }}
       cancel-in-progress: false
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
       - name: Notify release-app — retag running
@@ -331,7 +331,7 @@ jobs:
           ) }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Notify release-app — deploy_develop running
         if: ${{ inputs.deploy_only != true }}
         run: |
@@ -412,8 +412,8 @@ jobs:
           && fromJSON(needs.compute_release.outputs.spec || '{}').fast_forward_main == true }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: azure/setup-helm@v4
+      - uses: actions/checkout@v5
+      - uses: azure/setup-helm@v5
       - name: Notify release-app — verify_truefoundry_oci running
         run: |
           python3 scripts/release/callback.py \
@@ -474,7 +474,7 @@ jobs:
           ) }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Notify release-app — deploy_prod running
         if: ${{ inputs.deploy_only != true }}
         run: |
@@ -512,7 +512,7 @@ jobs:
     if: ${{ always() && inputs.deploy_only != true }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Notify release-app — finalize running
         if: ${{ always() }}
         run: |
@@ -531,7 +531,7 @@ jobs:
             --publish-result '${{ needs.publish_releases.result }}' \
             --run-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
       - name: Upload release record
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: release-record
           path: release-record.json

@@ -40,7 +40,7 @@ jobs:
   notify_start:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Notify release-app — publish running
         run: |
           python3 scripts/release/callback.py \
@@ -58,7 +58,7 @@ jobs:
         repo: ${{ fromJSON(inputs.spec).repos }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Publish service release tag and GitHub release
         id: publish
         env:
@@ -117,7 +117,7 @@ jobs:
           (needs.per_service.result == 'success' || needs.per_service.result == 'skipped') }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Publish helm-charts release
         env:
           GH_TOKEN: ${{ secrets.TF_GITHUB_CI_ADMIN_TOKEN }}
@@ -138,7 +138,7 @@ jobs:
     if: ${{ always() }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Notify release-app — publish
         env:
           PER_SERVICE_RESULT: ${{ needs.per_service.result }}
