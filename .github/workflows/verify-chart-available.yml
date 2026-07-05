@@ -85,6 +85,7 @@ jobs:
         env:
           REGISTRY_USER: ${{ secrets.TRUEFOUNDRY_ARTIFACTORY_PUBLIC_USERNAME }}
           REGISTRY_PASS: ${{ secrets.TRUEFOUNDRY_ARTIFACTORY_PUBLIC_PASSWORD }}
+          GH_TOKEN: ${{ secrets.TF_GITHUB_CI_ADMIN_TOKEN }}
         run: |
           set -uo pipefail
           deadline=$(( $(date +%s) + ${{ inputs.timeout_seconds }} ))
@@ -95,6 +96,15 @@ jobs:
           fi
           CHART='${{ inputs.chart }}'
           VER='${{ inputs.version }}'
+          # gh-pages self-heal: chart-releaser can update the gh-pages BRANCH
+          # while the Pages BUILD errors (transient GitHub-side failure), which
+          # leaves the CDN serving a stale index forever. When polling a
+          # *.github.io URL, detect an errored latest build and requeue it.
+          PAGES_REPO=""
+          if [ "$SRC" = "helm-repo" ]; then
+            PAGES_REPO=$(echo "$LOC" | sed -nE 's#https?://([^./]+)\.github\.io/([^/]+).*#\1/\2#p')
+          fi
+          REBUILDS=0
           while :; do
             if [ "$SRC" = "oci" ]; then
               if helm pull "oci://${LOC}/${CHART}" --version "$VER" >/dev/null 2>&1; then
@@ -106,6 +116,14 @@ jobs:
               helm repo update _verify >/dev/null 2>&1 || true
               if helm search repo "_verify/${CHART}" --version "$VER" 2>/dev/null | grep -q "$VER"; then
                 echo "Available: ${LOC} ${CHART} ${VER}"; exit 0
+              fi
+              if [ -n "$PAGES_REPO" ] && [ "$REBUILDS" -lt 2 ]; then
+                BUILD_STATUS=$(gh api "repos/$PAGES_REPO/pages/builds/latest" --jq '.status' 2>/dev/null || echo "")
+                if [ "$BUILD_STATUS" = "errored" ]; then
+                  echo "::warning::Pages build for $PAGES_REPO errored — requeueing (attempt $((REBUILDS+1)))"
+                  gh api -X POST "repos/$PAGES_REPO/pages/builds" >/dev/null 2>&1 || true
+                  REBUILDS=$((REBUILDS+1))
+                fi
               fi
             else
               echo "::error::unknown source_type '$SRC'"; exit 2
