@@ -71,11 +71,37 @@ def manifest_exists(image_ref: str) -> bool:
     return result.returncode == 0
 
 
-def already_built(component: dict[str, Any], tag: str) -> bool:
-    refs = expected_image_refs(component, tag)
+def git_tag_exists(repo: str, tag: str) -> bool:
+    result = run(["gh", "api", f"repos/{repo}/git/ref/tags/{tag}"], check=False)
+    return result.returncode == 0
+
+
+def images_exist(component: dict[str, Any], ref_tag: str) -> bool:
+    refs = expected_image_refs(component, ref_tag)
     if not refs:
         return False
     return all(manifest_exists(ref) for ref in refs)
+
+
+def already_built(component: dict[str, Any], tag: str) -> bool:
+    """True only when BOTH release artifacts exist: the image manifests AND
+    the git tag in the service repo. An image without its git tag is not a
+    completed release step — it's residue (an aborted run whose tag push
+    failed, or a stale registry tag left over from an earlier line) and
+    trusting it would skip the build AND the git-tag publish, leaving retag
+    (prod promote) unable to resolve the tag's commit. Falling through
+    dispatches a fresh build, which overwrites the registry tag and publishes
+    the git tag — self-healing either way."""
+    if not images_exist(component, tag):
+        return False
+    if not git_tag_exists(component["repository"], tag):
+        print(
+            f"image(s) for {tag} exist but git tag {tag} is missing in "
+            f"{component['repository']}; treating as NOT built",
+            file=sys.stderr,
+        )
+        return False
+    return True
 
 
 def unchanged_since_last_build(component: dict[str, Any], commit_sha: str) -> bool:
@@ -83,8 +109,9 @@ def unchanged_since_last_build(component: dict[str, Any], commit_sha: str) -> bo
 
     build-n-publish tags every image with extra_image_tag=<github.sha>, so an
     existing :<sha> image means the branch content is unchanged since the last
-    build and there is nothing new to build for this release."""
-    return already_built(component, commit_sha)
+    build and there is nothing new to build for this release. (Images only —
+    no git tag is ever published for bare commit SHAs.)"""
+    return images_exist(component, commit_sha)
 
 
 def dispatch_workflow(repo: str, workflow_file: str, branch: str, image_tag: str) -> None:
